@@ -1,0 +1,12 @@
+[package]
+name = "riscvm-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bit = "0.1.1"
+elf = "0.7.4"
+goblin = "0.8.2"
+intervaltree = "0.2.7"
+thiserror = "1.0.64"
+tracing = "0.1.40"

@@ -1,0 +1,9 @@
+[package]
+name = "riscvm-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+riscvm-core = { path = "../riscvm-core" }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
