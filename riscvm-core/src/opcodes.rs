@@ -106,7 +106,7 @@ pub const fn is_rv64i_sub_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_sll_instruction(ins: u32) -> bool {
     let sll_format: u32 = 0b0000_0000_0000_0000_0001_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == sll_format
@@ -432,6 +432,118 @@ pub const fn is_rv64i_subw_instruction(ins: u32) -> bool {
     extracted == format
 }
 
+pub const fn is_rv64i_slliw_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0000_0000_0000_0001_0000_0001_1011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64i_srliw_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0000_0000_0000_0101_0000_0001_1011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64i_sllw_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0000_0000_0000_0001_0000_0011_1011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64i_srlw_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0000_0000_0000_0101_0000_0011_1011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64i_sraw_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0100_0000_0000_0000_0101_0000_0011_1011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64i_lwu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0000_0000_0000_0110_0000_0000_0011;
+    let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_mul_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0000_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_mulh_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0001_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_mulhsu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0010_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_mulhu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0011_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_div_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0100_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_divu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0101_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_rem_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0110_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64m_remu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b0000_0010_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -482,9 +594,23 @@ pub mod tests {
         map.insert("ld", 0x00043283);
         map.insert("sd", 0x00543023);
         map.insert("addiw", 0x0007879b);
+        map.insert("slliw", 0x0052929b);
+        map.insert("srliw", 0x0052d29b);
         map.insert("sraiw", 0x41f7d79b);
         map.insert("subw", 0x40f007bb);
         map.insert("addw", 0x00f707bb);
+        map.insert("sllw", 0x005292bb);
+        map.insert("srlw", 0x0052d2bb);
+        map.insert("sraw", 0x4052d2bb);
+        map.insert("lwu", 0x0002e283);
+        map.insert("mul", 0x025282b3);
+        map.insert("mulh", 0x025292b3);
+        map.insert("mulhu", 0x0252b2b3);
+        map.insert("mulhsu", 0x0252a2b3);
+        map.insert("div", 0x0252c2b3);
+        map.insert("divu", 0x0252d2b3);
+        map.insert("rem", 0x0252e2b3);
+        map.insert("remu", 0x0252f2b3);
 
         for (name, ins) in map {
             if (is_rv64i_add_instruction(ins) && name != "add")
@@ -715,6 +841,18 @@ pub mod tests {
                 return Err(format!("{name}: {ins:#08x}, is not an addiw instruction!").into());
             }
 
+            if is_rv64i_slliw_instruction(ins) && name != "slliw"
+                || (!is_rv64i_slliw_instruction(ins) && name == "slliw")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an slliw instruction!").into());
+            }
+
+            if is_rv64i_srliw_instruction(ins) && name != "srliw"
+                || (!is_rv64i_srliw_instruction(ins) && name == "srliw")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an srliw instruction!").into());
+            }
+
             if is_rv64i_sraiw_instruction(ins) && name != "sraiw"
                 || (!is_rv64i_sraiw_instruction(ins) && name == "sraiw")
             {
@@ -724,13 +862,85 @@ pub mod tests {
             if is_rv64i_addw_instruction(ins) && name != "addw"
                 || (!is_rv64i_addw_instruction(ins) && name == "addw")
             {
-                return Err(format!("{name}: {ins:#08x}, is not an subw instruction!").into());
+                return Err(format!("{name}: {ins:#08x}, is not an addw instruction!").into());
             }
 
             if is_rv64i_subw_instruction(ins) && name != "subw"
                 || (!is_rv64i_subw_instruction(ins) && name == "subw")
             {
                 return Err(format!("{name}: {ins:#08x}, is not an subw instruction!").into());
+            }
+
+            if is_rv64i_sllw_instruction(ins) && name != "sllw"
+                || (!is_rv64i_sllw_instruction(ins) && name == "sllw")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an sllw instruction!").into());
+            }
+
+            if is_rv64i_srlw_instruction(ins) && name != "srlw"
+                || (!is_rv64i_srlw_instruction(ins) && name == "srlw")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an srlw instruction!").into());
+            }
+
+            if is_rv64i_sraw_instruction(ins) && name != "sraw"
+                || (!is_rv64i_sraw_instruction(ins) && name == "sraw")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an sraw instruction!").into());
+            }
+
+            if is_rv64i_lwu_instruction(ins) && name != "lwu"
+                || (!is_rv64i_lwu_instruction(ins) && name == "lwu")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an srlw instruction!").into());
+            }
+
+            if is_rv64m_mul_instruction(ins) && name != "mul"
+                || (!is_rv64m_mul_instruction(ins) && name == "mul")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an mul instruction!").into());
+            }
+
+            if is_rv64m_mulh_instruction(ins) && name != "mulh"
+                || (!is_rv64m_mulh_instruction(ins) && name == "mulh")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an mulh instruction!").into());
+            }
+
+            if is_rv64m_mulhu_instruction(ins) && name != "mulhu"
+                || (!is_rv64m_mulhu_instruction(ins) && name == "mulhu")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an mulhu instruction!").into());
+            }
+
+            if is_rv64m_mulhsu_instruction(ins) && name != "mulhsu"
+                || (!is_rv64m_mulhsu_instruction(ins) && name == "mulhsu")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an mulhsu instruction!").into());
+            }
+
+            if is_rv64m_div_instruction(ins) && name != "div"
+                || (!is_rv64m_div_instruction(ins) && name == "div")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an div instruction!").into());
+            }
+
+            if is_rv64m_divu_instruction(ins) && name != "divu"
+                || (!is_rv64m_divu_instruction(ins) && name == "divu")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an divu instruction!").into());
+            }
+
+            if is_rv64m_rem_instruction(ins) && name != "rem"
+                || (!is_rv64m_rem_instruction(ins) && name == "rem")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an rem instruction!").into());
+            }
+
+            if is_rv64m_remu_instruction(ins) && name != "remu"
+                || (!is_rv64m_remu_instruction(ins) && name == "remu")
+            {
+                return Err(format!("{name}: {ins:#08x}, is not an remu instruction!").into());
             }
         }
 

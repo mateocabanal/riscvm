@@ -1,7 +1,6 @@
 use bit::BitIndex;
 use tracing::debug;
 use tracing::info;
-use tracing::level_filters::LevelFilter;
 use tracing::span;
 use tracing::trace;
 use tracing::Level;
@@ -189,6 +188,15 @@ impl RV64GC {
                 RV64GCInstruction::Sb(rs1, rs2, offset)
             }
 
+            i if is_rv64i_sh_instruction(i) => {
+                let lo_offset = i.bit_range(7..12);
+                let hi_offset = i.bit_range(25..32);
+
+                let offset = (hi_offset << 5) | lo_offset;
+
+                RV64GCInstruction::Sh(rs1, rs2, offset)
+            }
+
             i if is_rv64i_lw_instruction(i) => RV64GCInstruction::Lw(rd, rs1, imm),
 
             i if is_rv64i_sw_instruction(i) => {
@@ -263,6 +271,18 @@ impl RV64GC {
 
             i if is_rv64i_addiw_instruction(i) => RV64GCInstruction::Addiw(rd, rs1, imm),
 
+            i if is_rv64i_slliw_instruction(i) => {
+                let shamt = current_ins.bit_range(20..26);
+
+                RV64GCInstruction::Slliw(rd, rs1, shamt)
+            }
+
+            i if is_rv64i_srliw_instruction(i) => {
+                let shamt = current_ins.bit_range(20..26);
+
+                RV64GCInstruction::Srliw(rd, rs1, shamt)
+            }
+
             i if is_rv64i_sraiw_instruction(i) => {
                 let shamt = i.bit_range(20..25);
 
@@ -272,6 +292,20 @@ impl RV64GC {
             i if is_rv64i_addw_instruction(i) => RV64GCInstruction::Addw(rd, rs1, rs2),
 
             i if is_rv64i_subw_instruction(i) => RV64GCInstruction::Subw(rd, rs1, rs2),
+
+            i if is_rv64i_sllw_instruction(i) => RV64GCInstruction::Sllw(rd, rs1, rs2),
+
+            i if is_rv64i_srlw_instruction(i) => RV64GCInstruction::Srlw(rd, rs1, rs2),
+
+            i if is_rv64i_sraw_instruction(i) => RV64GCInstruction::Sraw(rd, rs1, rs2),
+
+            i if is_rv64i_lwu_instruction(i) => RV64GCInstruction::Lwu(rd, rs1, imm),
+
+            i if is_rv64m_mul_instruction(i) => RV64GCInstruction::Mul(rd, rs1, rs2),
+
+            i if is_rv64m_div_instruction(i) => RV64GCInstruction::Div(rd, rs1, rs2),
+
+            i if is_rv64m_rem_instruction(i) => RV64GCInstruction::Rem(rd, rs1, rs2),
 
             _ => {
                 panic!("instruction not implemented, instruction: {current_ins:08x}",);
@@ -375,9 +409,18 @@ pub enum RV64GCInstruction {
     Ld(Reg, Reg, Imm),
     Sd(Reg, Reg, Imm),
     Addiw(Reg, Reg, Imm),
+    Slliw(Reg, Reg, Imm),
+    Srliw(Reg, Reg, Imm),
     Sraiw(Reg, Reg, Imm),
     Addw(Reg, Reg, Reg),
     Subw(Reg, Reg, Reg),
+    Sllw(Reg, Reg, Reg),
+    Srlw(Reg, Reg, Reg),
+    Sraw(Reg, Reg, Reg),
+    Lwu(Reg, Reg, Imm),
+    Mul(Reg, Reg, Reg),
+    Div(Reg, Reg, Reg),
+    Rem(Reg, Reg, Reg),
 }
 
 impl RV64GCInstruction {
@@ -397,12 +440,13 @@ impl RV64GCInstruction {
             }
 
             RV64GCInstruction::Auipc(rd, imm) => {
-                cpu.registers[rd] =
-                    (cpu.registers[Pc] as i64).wrapping_add(sign_extend12(*imm << 12)) as u64;
+                cpu.registers[rd] = (cpu.registers[Pc] as i64)
+                    .wrapping_add(sign_extend(u64::from(*imm << 12), 20))
+                    as u64;
             }
 
             RV64GCInstruction::Lui(rd, imm) => {
-                cpu.registers[rd] = sign_extend12(*imm << 12) as u64;
+                cpu.registers[rd] = sign_extend(u64::from(*imm << 12), 20) as u64;
             }
 
             RV64GCInstruction::Slti(rd, rs1, imm) => {
@@ -724,10 +768,29 @@ impl RV64GCInstruction {
                 cpu.registers[rd] = sign_extend(value as u64, 32) as u64;
             }
 
-            RV64GCInstruction::Sraiw(rd, rs1, shamt) => {
-                let shifted_reg = cpu.registers[rs1] & (u32::MAX as u64);
+            RV64GCInstruction::Slliw(rd, rs1, shamt) => {
+                let shifted_val = cpu.registers[rs1] & u32::MAX as u64;
+                let val = u32::try_from(shifted_val).unwrap().wrapping_shl(*shamt);
 
-                cpu.registers[rd] = sign_extend(shifted_reg >> shamt, 32) as u64;
+                cpu.registers[rd] = sign_extend(val.into(), 32) as u64;
+            }
+
+            RV64GCInstruction::Srliw(rd, rs1, shamt) => {
+                let val = (cpu.registers[rs1] as u32).wrapping_shr(*shamt);
+
+                cpu.registers[rd] = sign_extend(val.into(), 32) as u64;
+            }
+
+            RV64GCInstruction::Sraiw(rd, rs1, shamt) => {
+                debug!("sraiw");
+                let bit_reg = cpu.registers[rs1].bit_range(0..32) as i32;
+                let shifted_reg = sign_extend(bit_reg.wrapping_shr(*shamt) as u64, 32);
+
+                debug!("\trs1: {}", bit_reg);
+                debug!("\tshamt: {shamt}");
+                debug!("\tvalue: {shifted_reg}");
+
+                cpu.registers[rd] = sign_extend(shifted_reg as u64, 32) as u64;
             }
 
             RV64GCInstruction::Addw(rd, rs1, rs2) => {
@@ -742,6 +805,56 @@ impl RV64GCInstruction {
                 let rs2_low = cpu.registers[rs2] & (u32::MAX as u64);
 
                 cpu.registers[rd] = sign_extend(rs1_low.wrapping_sub(rs2_low), 32) as u64;
+            }
+
+            RV64GCInstruction::Sllw(rd, rs1, rs2) => {
+                let shifted_val = cpu.registers[rs1] << (cpu.registers[rs2] & 0b11111);
+                cpu.registers[rd] = sign_extend(shifted_val.bit_range(0..32), 32) as u64;
+            }
+
+            RV64GCInstruction::Srlw(rd, rs1, rs2) => {
+                let shifted_val =
+                    (cpu.registers[rs1].bit_range(0..32)) >> (cpu.registers[rs2] & 0b11111);
+                cpu.registers[rd] = sign_extend(shifted_val, 32) as u64;
+            }
+
+            RV64GCInstruction::Sraw(rd, rs1, rs2) => {
+                let shifted_val =
+                    (cpu.registers[rs1].bit_range(0..32) as i32) >> (cpu.registers[rs2] & 0b11111);
+                cpu.registers[rd] = sign_extend(u64::from(shifted_val as u32), 32) as u64;
+            }
+
+            RV64GCInstruction::Lwu(rd, rs1, offset) => {
+                let addr = (cpu.registers[rs1] as i64).wrapping_add(sign_extend12(*offset));
+                let mem = cpu.ram.read_word(addr as u64).unwrap();
+
+                cpu.registers[rd] = sign_extend(u64::from(mem), 32) as u64;
+            }
+
+            RV64GCInstruction::Mul(rd, rs1, rs2) => {
+                let value = cpu.registers[rs1].wrapping_mul(cpu.registers[rs2]);
+
+                cpu.registers[rd] = value & (u32::MAX as u64);
+            }
+
+            RV64GCInstruction::Div(rd, rs1, rs2) => {
+                if cpu.registers[rs2] == 0 {
+                    cpu.registers[rd] = -1i64 as u64;
+                    return;
+                }
+
+                let value = (cpu.registers[rs1] as i64) / (cpu.registers[rs2] as i64);
+                cpu.registers[rd] = value as u64;
+            }
+
+            RV64GCInstruction::Rem(rd, rs1, rs2) => {
+                if cpu.registers[rs2] == 0 {
+                    cpu.registers[rd] = -1i64 as u64;
+                    return;
+                }
+
+                let value = (cpu.registers[rs1] as i64) % (cpu.registers[rs2] as i64);
+                cpu.registers[rd] = value as u64;
             }
         }
     }
