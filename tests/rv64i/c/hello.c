@@ -41,9 +41,10 @@ int reverse_int(int num) {
   int reversed = 0;
 
   while (num != 0) {
-    int digit = hw_mod(num, 10);        // Extract the last digit
-    reversed = (reversed * 10) + digit; // Append the digit to reversed number
-    num = hw_div(num, 10);              // Remove the last digit from num
+    int digit = hw_mod(num, 10); // Extract the last digit
+    reversed =
+        hw_mul(reversed, 10) + digit; // Append the digit to reversed number
+    num = hw_div(num, 10);            // Remove the last digit from num
   }
 
   return reversed;
@@ -56,7 +57,7 @@ void print_int(int num) {
   int i = 0;
   while (reversed != 0) {
     buf[i] = hw_mod(reversed, 10) + 48;
-    reversed = reversed / 10;
+    reversed = hw_div(reversed, 10);
     i++;
   }
 
