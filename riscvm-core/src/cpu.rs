@@ -347,6 +347,12 @@ impl RV64GC {
                 info!("Program exited with code: {error_code}");
                 self.should_quit = true;
             }
+
+            1000 => {
+                let ptr = self.registers[A0] as i64;
+                info!("i64: {}", ptr);
+            }
+
             _ => todo!(),
         }
     }
@@ -784,7 +790,7 @@ impl RV64GCInstruction {
             RV64GCInstruction::Sraiw(rd, rs1, shamt) => {
                 debug!("sraiw");
                 let bit_reg = cpu.registers[rs1].bit_range(0..32) as i32;
-                let shifted_reg = sign_extend(bit_reg.wrapping_shr(*shamt) as u64, 32);
+                let shifted_reg = sign_extend(u64::from((bit_reg >> shamt) as u32), 32);
 
                 debug!("\trs1: {}", bit_reg);
                 debug!("\tshamt: {shamt}");
@@ -838,22 +844,36 @@ impl RV64GCInstruction {
             }
 
             RV64GCInstruction::Div(rd, rs1, rs2) => {
-                if cpu.registers[rs2] == 0 {
-                    cpu.registers[rd] = -1i64 as u64;
+                let dividend = cpu.registers[rs1] as i64;
+                let divisor = cpu.registers[rs2] as i64;
+                if divisor == 0 {
+                    cpu.registers[rd] = u64::MAX;
                     return;
                 }
 
-                let value = (cpu.registers[rs1] as i64) / (cpu.registers[rs2] as i64);
+                if dividend == i64::MIN && divisor == -1 {
+                    cpu.registers[rd] = dividend as u64;
+                    return;
+                }
+
+                let value = dividend.wrapping_div(divisor);
                 cpu.registers[rd] = value as u64;
             }
 
             RV64GCInstruction::Rem(rd, rs1, rs2) => {
-                if cpu.registers[rs2] == 0 {
-                    cpu.registers[rd] = -1i64 as u64;
+                let dividend = cpu.registers[rs1] as i64;
+                let divisor = cpu.registers[rs2] as i64;
+                if divisor == 0 {
+                    cpu.registers[rd] = dividend as u64;
                     return;
                 }
 
-                let value = (cpu.registers[rs1] as i64) % (cpu.registers[rs2] as i64);
+                if dividend == i64::MIN && divisor == -1 {
+                    cpu.registers[rd] = 0;
+                    return;
+                }
+
+                let value = dividend.wrapping_rem(divisor);
                 cpu.registers[rd] = value as u64;
             }
         }

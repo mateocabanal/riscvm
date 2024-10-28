@@ -7,6 +7,12 @@ void print_str(char *msg, int len) {
       "r"(len));
 }
 
+void rvm_print_u64_mem(unsigned long long a) {
+  asm("addi a7, x0, 1000\n"
+      "add a0, x0, %[ptr]\n"
+      "ecall" ::[ptr] "r"(a));
+}
+
 int hw_mul(int a, int b) {
   int val = 0;
 
@@ -74,6 +80,7 @@ void exit(int code) {
 void fib(int n) {
   int t1 = 0, t2 = 1, nextTerm = 1;
   for (int i = 3; i <= n; ++i) {
+    rvm_print_u64_mem(nextTerm);
     print_int(nextTerm);
 
     if (i != n)
