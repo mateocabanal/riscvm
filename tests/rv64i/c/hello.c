@@ -61,8 +61,11 @@ void print_int(int num) {
   int reversed = reverse_int(num);
 
   int i = 0;
+  print_str("rem: ", 5);
   while (reversed != 0) {
-    buf[i] = hw_mod(reversed, 10) + 48;
+    int rem = hw_mod(reversed, 10);
+    rvm_print_u64_mem(rem);
+    buf[i] = rem + 48;
     reversed = hw_div(reversed, 10);
     i++;
   }
@@ -80,7 +83,6 @@ void exit(int code) {
 void fib(int n) {
   int t1 = 0, t2 = 1, nextTerm = 1;
   for (int i = 3; i <= n; ++i) {
-    rvm_print_u64_mem(nextTerm);
     print_int(nextTerm);
 
     if (i != n)

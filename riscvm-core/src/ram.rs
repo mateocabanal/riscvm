@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
+use tracing::trace;
+
 #[derive(Debug)]
 pub struct Ram {
     regions: Vec<MemoryRegion>,
+    pub lowest_unalloced_addr: u64,
 }
 
 impl Default for Ram {
@@ -15,6 +18,7 @@ impl Ram {
     pub fn new() -> Ram {
         Ram {
             regions: Vec::new(),
+            lowest_unalloced_addr: 0,
         }
     }
 
@@ -30,8 +34,57 @@ impl Ram {
             .binary_search_by_key(&region.start, |r| r.start)
             .unwrap_or_else(|e| e);
 
+        if region.start + region.size > self.lowest_unalloced_addr {
+            self.lowest_unalloced_addr = region.start + region.size;
+        }
+
         // Insert the region at the correct position
         self.regions.insert(index, region);
+
+        Ok(())
+    }
+
+    pub fn extend_region(&mut self, addr: u64, addition: u64) -> Result<(), MemoryError> {
+        let region = self
+            .find_region_mut(addr)
+            .ok_or(MemoryError::InvalidAddress(addr));
+
+        let Ok(region) = region else {
+            return region.map(|i| ());
+        };
+
+        region.extend(addition);
+
+        Ok(())
+    }
+
+    pub fn extend_text_region(&mut self, addition: u64) -> Result<(), MemoryError> {
+        let region = self.regions.iter_mut().find(|reg| reg.is_text()).unwrap();
+        region.extend(addition);
+
+        Ok(())
+    }
+
+    pub fn remove_region(&mut self, addr: u64) -> Result<(), MemoryError> {
+        let region = self
+            .find_region(addr)
+            .ok_or(MemoryError::InvalidAddress(addr));
+
+        let Ok(region) = region else {
+            return region.map(|i| ());
+        };
+
+        let index = self
+            .regions
+            .binary_search_by_key(&region.start, |r| r.start)
+            .unwrap();
+
+        if region.start + region.size == self.lowest_unalloced_addr {
+            self.lowest_unalloced_addr = self.regions.last().map(|i| i.start + i.size).unwrap_or(0);
+        }
+
+        self.regions.remove(index);
+
         Ok(())
     }
 
@@ -91,6 +144,7 @@ impl Ram {
         let region = self
             .find_region_mut(address)
             .ok_or(MemoryError::InvalidAddress(address))?;
+        trace!("addr: {address:08x}");
         let offset = (address - region.start) as usize;
         region.data[offset] = value;
         Ok(())
@@ -112,7 +166,7 @@ impl Ram {
         self.write_nbytes(address, value, 8)
     }
 
-    fn read_nbytes(&self, address: u64, len: u64) -> Result<u64, MemoryError> {
+    pub fn read_nbytes(&self, address: u64, len: u64) -> Result<u64, MemoryError> {
         let mut result = Vec::new();
         for addr in address..address + len {
             result.push(self.read_byte(addr)?)
@@ -124,7 +178,7 @@ impl Ram {
             .fold(0u64, |res, (idx, val)| res + (u64::from(*val) << (8 * idx))))
     }
 
-    fn write_nbytes(&mut self, address: u64, value: u64, len: u64) -> Result<(), MemoryError> {
+    pub fn write_nbytes(&mut self, address: u64, value: u64, len: u64) -> Result<(), MemoryError> {
         for (idx, addr) in (address..address + len).enumerate() {
             self.write_byte(addr, ((value >> (8 * idx)) & 0xFF) as u8)?;
         }
@@ -170,6 +224,7 @@ impl Display for Ram {
 pub struct MemoryRegion {
     start: u64,
     size: u64,
+    flags: u64,
     data: Vec<u8>,
 }
 
@@ -185,13 +240,36 @@ impl Display for MemoryRegion {
 
 impl MemoryRegion {
     pub fn new(start: u64, size: u64, data: Vec<u8>) -> Self {
-        MemoryRegion { start, size, data }
+        MemoryRegion {
+            start,
+            size,
+            data,
+            flags: 0,
+        }
+    }
+
+    pub fn new_with_flags(start: u64, size: u64, data: Vec<u8>, flags: u64) -> Self {
+        MemoryRegion {
+            start,
+            size,
+            data,
+            flags,
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.flags & 1 == 1
+    }
+
+    pub fn extend(&mut self, addition: u64) {
+        self.data.extend(vec![0u8; addition as usize]);
+        self.size += addition;
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
-    #[error("Invalid address: {0:#08x}")]
+    #[error("Invalid address: {0:08x}")]
     InvalidAddress(u64),
     #[error("Permission denied at address: 0x{0:X}")]
     PermissionDenied(u64),

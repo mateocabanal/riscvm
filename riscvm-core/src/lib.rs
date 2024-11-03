@@ -1,9 +1,11 @@
 pub mod cpu;
 pub mod csr;
 pub mod exception;
+pub mod fcsr;
 pub mod mmu;
 pub mod opcodes;
 pub mod ram;
+pub mod syscalls;
 
 pub fn sign_extend12(n: u32) -> i64 {
     sign_extend(n.into(), 12)
