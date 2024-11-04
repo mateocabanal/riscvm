@@ -73,6 +73,8 @@ pub fn mmap(cpu: &mut RV64GC) {
 
     println!("mmap\n\taddr: {addr}\n\tlen: {len}\n\tprot: {prot}\n\tflags: {flags}\n\tfd: {fd}\n\toffset: {offset}");
 
+    println!("{}", cpu.registers);
+
     if len == 0 {
         panic!("mmap called with no len!")
     }

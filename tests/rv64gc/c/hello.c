@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 
 void print_str(char *str, int len) {
   asm("addi a7, zero, 64\n"
@@ -7,7 +9,7 @@ void print_str(char *str, int len) {
       [len] "r"(len));
 }
 
-int main() {
-  print_str("Hello World\n", 13);
-  return 0;
+void _start() {
+  printf("Hello World\n");
+  exit(0);
 }

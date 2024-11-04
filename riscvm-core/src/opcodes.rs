@@ -187,7 +187,7 @@ pub const fn is_rv64i_ebreak_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_fence_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0000_0000_0011_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0000_0000_0000_1111;
     let mask: u32 = 0b1111_0000_0000_1111_1111_1111_1111_1111;
 
     let extracted = ins & mask;

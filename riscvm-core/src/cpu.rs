@@ -56,7 +56,7 @@ pub struct RV64GC {
     pub fcsr: FCSR,
     pub ram: Ram,
     pub should_quit: bool,
-    elf_phdr: Box<[u8]>,
+    points_to_break: Box<[u64]>,
 }
 
 impl Default for RV64GC {
@@ -66,17 +66,20 @@ impl Default for RV64GC {
 }
 
 impl RV64GC {
-    fn write_auxv_to_stack(&mut self, elf: Elf, phdr_ptr: u64) -> u64 {
-        let map = [
+    fn write_auxv_to_stack(&mut self, elf: Elf, phdr_ptr: Option<u64>) -> u64 {
+        let mut map = vec![
             (AT_NULL, 0),
             (AT_PAGESZ, 4096),
             (AT_CLKTCK, 100),
-            (AT_PHDR, phdr_ptr),
             (AT_PHENT, elf.header.e_phentsize.into()),
             (AT_PHNUM, elf.header.e_phnum.into()),
             (AT_ENTRY, elf.entry),
             (AT_SECURE, 0),
         ];
+
+        if let Some(p) = phdr_ptr {
+            map.push((AT_PHDR, p))
+        }
 
         let mut sp = self.registers[Sp];
         for (k, v) in map.iter() {
@@ -90,7 +93,7 @@ impl RV64GC {
         sp
     }
 
-    fn initialize_stack(&mut self, elf: Elf, phdr_addr: u64) {
+    fn initialize_stack(&mut self, elf: Elf, phdr_addr: Option<u64>) {
         let ram = &mut self.ram;
         let args = std::env::args().collect::<Vec<String>>();
         let mut sp = 0x7FFF_FFFF_FFFF_FFF0;
@@ -171,13 +174,15 @@ impl RV64GC {
 
         let float_registers = RV64GCFloatRegisters::new();
 
+        let points_to_break = vec![0x00015d78, 0x000106b0].into_boxed_slice();
+
         RV64GC {
             registers,
             float_registers,
             ram,
             fcsr: FCSR::new(),
             should_quit: false,
-            elf_phdr: Box::new([0u8]),
+            points_to_break,
         }
     }
 
@@ -231,7 +236,7 @@ impl RV64GC {
             }
         }
 
-        self.initialize_stack(elf, ehdr.unwrap());
+        self.initialize_stack(elf, ehdr);
 
         trace!("mem regions: {}", self.ram);
 
@@ -256,6 +261,11 @@ impl RV64GC {
         let _guard = span.enter();
 
         trace!("pc: {:08x}", self.registers[Pc]);
+
+        if self.points_to_break.contains(&self.registers[Pc]) {
+            println!("{}", &self.registers);
+        }
+
         self.execute();
         assert_eq!(self.registers[0], 0);
     }
@@ -296,7 +306,10 @@ impl RV64GC {
                 i if is_rv64c_add_instruction(i) => Cadd(c_rs1, c_rs2),
 
                 i if is_rv64c_jr_instruction(i) => Cjr(c_rs1),
-                i if is_rv64c_mv_instruction(i) => Cmv(c_rs1, c_rs2),
+                i if is_rv64c_mv_instruction(i) => {
+                    trace!("c.mv opcode: {i:04x}");
+                    Cmv(c_rs1, c_rs2)
+                }
 
                 i if is_rv64c_addi_instruction(i) => {
                     let imm = (i.bit(12) as u32) << 5 | (i.bit_range(2..7) as u32);
@@ -318,6 +331,8 @@ impl RV64GC {
 
                 i if is_rv64c_lui_instruction(i) => {
                     let imm = (i.bit(12) as u32) << 17 | u32::from(i.bit_range(2..7)) << 12;
+
+                    trace!("c.lui imm: {}", sign_extend(imm as u64, 18));
 
                     Clui(c_rs1, imm)
                 }
@@ -362,6 +377,8 @@ impl RV64GC {
                         | u32::from(i.bit_range(11..13)) << 4
                         | (i.bit(5) as u32) << 3
                         | (i.bit(6) as u32) << 2;
+
+                    trace!("c.addi4spn opcode: {i:04x}");
 
                     Caddi4spn(x2_rs1, imm)
                 }
@@ -487,12 +504,12 @@ impl RV64GC {
             i if is_rv64i_addi_instruction(i) => Addi(rd, rs1, imm),
 
             i if is_rv64i_auipc_instruction(i) => {
-                let ov_imm = i.bit_range(12..32);
+                let ov_imm = i.bit_range(12..32) << 12;
                 Auipc(rd, ov_imm)
             }
 
             i if is_rv64i_lui_instruction(i) => {
-                let ov_imm = i.bit_range(12..32);
+                let ov_imm = i.bit_range(12..32) << 12;
                 Lui(rd, ov_imm)
             }
 
@@ -532,6 +549,10 @@ impl RV64GC {
             i if is_rv64i_or_instruction(i) => Or(rd, rs1, rs2),
 
             i if is_rv64i_ecall_instruction(i) => Ecall,
+
+            i if is_rv64i_fence_instruction(i) => {
+                Fence(i.bit_range(20..24) as u8, i.bit_range(24..28) as u8)
+            }
 
             i if is_rv64i_lb_instruction(i) => Lb(rd, rs1, imm),
 
@@ -833,6 +854,17 @@ impl RV64GC {
                 self.should_quit = true;
             }
 
+            // NOTE: set_tid
+            96 => {
+                // PID
+                self.registers[A0] = 0;
+            }
+
+            // NOTE: set_robust_list
+            99 => {
+                self.registers[A0] = 0;
+            }
+
             214 => brk(self),
 
             222 => mmap(self),
@@ -1089,17 +1121,19 @@ impl RV64GCInstruction {
 
             Addi(rd, rs1, imm) => {
                 let simm = sign_extend12(*imm);
-                cpu.registers[rd] = (cpu.registers[rs1] as i64).wrapping_add(simm) as u64;
+                trace!("addi rs1: {}", cpu.registers[rs1]);
+                cpu.registers[rd] = cpu.registers[rs1].wrapping_add_signed(simm);
             }
 
             Auipc(rd, imm) => {
                 cpu.registers[rd] = (cpu.registers[Pc] as i64)
-                    .wrapping_add(sign_extend(u64::from(*imm << 12), 20))
+                    .wrapping_add(sign_extend(u64::from(*imm), 32))
                     as u64;
             }
 
             Lui(rd, imm) => {
-                cpu.registers[rd] = sign_extend(u64::from(*imm << 12), 20) as u64;
+                let val = u64::from(*imm);
+                cpu.registers[rd] = sign_extend(val, 32) as u64;
             }
 
             Slti(rd, rs1, imm) => {
@@ -1202,9 +1236,7 @@ impl RV64GCInstruction {
                 cpu.registers[rd] = cpu.registers[rs1] & cpu.registers[rs2];
             }
 
-            Fence(_, _) => {
-                todo!()
-            }
+            Fence(_, _) => {}
 
             FenceI => todo!(),
 
@@ -1306,16 +1338,23 @@ impl RV64GCInstruction {
 
             Ld(rd, rs1, imm) => {
                 let simm = sign_extend12(*imm);
+                let addr = cpu.registers[rs1].wrapping_add_signed(simm);
+
+                trace!("ld addr: {addr:08x}");
+
                 cpu.registers[rd] = cpu
                     .ram
-                    .read_doubleword((cpu.registers[rs1] as i64 + simm) as u64)
+                    .read_doubleword(addr)
                     .inspect_err(|e| panic!("{e}"))
                     .unwrap();
             }
 
             Sd(rs1, rs2, imm) => {
                 let simm = sign_extend12(*imm);
-                let addr = (cpu.registers[rs1] as i64).wrapping_add(simm);
+                let addr = cpu.registers[rs1].wrapping_add_signed(simm);
+
+                trace!("sd addr: {addr:08x}");
+
                 cpu.ram
                     .write_doubleword(addr as u64, cpu.registers[rs2])
                     .inspect_err(|e| panic!("{e}\nAddress: {:08x}", cpu.registers[rs1]))
@@ -2173,7 +2212,7 @@ impl RV64GCInstruction {
 
             Cjr(rs1) => {
                 // Subtract 2, since we add 2 after this instruction
-                cpu.registers[Pc] = cpu.registers[rs1] - 2;
+                cpu.registers[Pc] = cpu.registers[rs1].wrapping_sub(2);
             }
 
             Cmv(rd, rs1) => cpu.registers[rd] = cpu.registers[rs1],
@@ -2188,7 +2227,7 @@ impl RV64GCInstruction {
 
             Caddi16sp(imm) => {
                 let simm = sign_extend(u64::from(*imm), 10);
-                cpu.registers[Sp] = (cpu.registers[Sp] as i64).wrapping_add(simm) as u64;
+                cpu.registers[Sp] = cpu.registers[Sp].wrapping_add_signed(simm);
             }
 
             Cli(rd, imm) => {
@@ -2251,8 +2290,8 @@ impl RV64GCInstruction {
             }
 
             Clui(rd, imm) => {
-                let rd = rd + 8;
-                cpu.registers[&rd] = *imm as u64;
+                let simm = sign_extend(*imm as u64, 18);
+                cpu.registers[rd] = simm as u64;
             }
 
             Candi(rd, imm) => {
@@ -2342,7 +2381,9 @@ impl Display for RV64GCInstruction {
             }
 
             Auipc(rd, imm) => {
-                write!(f, "auipc x{rd}, {imm}")
+                trace!("auipc offset: {imm:04x}");
+                let simm = sign_extend(*imm as u64, 32);
+                write!(f, "auipc x{rd}, {simm}")
             }
 
             Xori(rd, rs1, imm) => {
@@ -2370,7 +2411,13 @@ impl Display for RV64GCInstruction {
             }
 
             Sd(rs1, rs2, offset) => {
-                write!(f, "sd x{rs2}, {offset}(x{rs1})")
+                let simm = sign_extend12(*offset);
+                write!(f, "sd x{rs2}, {simm}(x{rs1})")
+            }
+
+            Ld(rd, rs1, offset) => {
+                let simm = sign_extend12(*offset);
+                write!(f, "ld x{rd}, {simm}(x{rs1})")
             }
 
             Jal(rd, imm) => {
@@ -2388,6 +2435,11 @@ impl Display for RV64GCInstruction {
                 write!(f, "bge x{rs1}, x{rs2}, {simm}")
             }
 
+            Lw(rd, rs1, imm) => {
+                let simm = sign_extend12(*imm);
+                write!(f, "lw x{rd}, x{rs1}, {simm}")
+            }
+
             e => write!(f, "{e:?}"),
         }
     }
@@ -2396,6 +2448,17 @@ impl Display for RV64GCInstruction {
 #[derive(Debug)]
 pub struct RV64GCRegisters {
     registers: [u64; 33],
+}
+
+impl Display for RV64GCRegisters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut buf = String::new();
+        for (i, c) in self.registers.iter().take(32).enumerate() {
+            buf.push_str(&format!("x{i}: 0x{c:016x}\n"));
+        }
+
+        write!(f, "{buf}")
+    }
 }
 
 impl Index<&u8> for RV64GCRegisters {

@@ -1,5 +1,5 @@
 CC = riscv64-linux-gnu-gcc
-CFLAGS = -march=rv64gc -nostdlib
+CFLAGS = -nostdlib
 SRCS = $(wildcard *.c)
 PROGS = $(patsubst %.c,%,$(SRCS))
 

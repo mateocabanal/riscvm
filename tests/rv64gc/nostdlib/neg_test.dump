@@ -1,0 +1,87 @@
+
+neg_test:     file format elf64-littleriscv
+
+
+Disassembly of section .text:
+
+000000000000030a <mmap>:
+ 30a:	7139                	addi	x2,x2,-64
+ 30c:	fc06                	sd	x1,56(x2)
+ 30e:	f822                	sd	x8,48(x2)
+ 310:	0080                	addi	x8,x2,64
+ 312:	fca43c23          	sd	x10,-40(x8)
+ 316:	fcb43823          	sd	x11,-48(x8)
+ 31a:	85b2                	mv	x11,x12
+ 31c:	8636                	mv	x12,x13
+ 31e:	86ba                	mv	x13,x14
+ 320:	873e                	mv	x14,x15
+ 322:	87ae                	mv	x15,x11
+ 324:	fcf42623          	sw	x15,-52(x8)
+ 328:	87b2                	mv	x15,x12
+ 32a:	fcf42423          	sw	x15,-56(x8)
+ 32e:	87b6                	mv	x15,x13
+ 330:	fcf42223          	sw	x15,-60(x8)
+ 334:	87ba                	mv	x15,x14
+ 336:	fcf42023          	sw	x15,-64(x8)
+ 33a:	fd843783          	ld	x15,-40(x8)
+ 33e:	fef43423          	sd	x15,-24(x8)
+ 342:	fe043023          	sd	x0,-32(x8)
+ 346:	fe843803          	ld	x16,-24(x8)
+ 34a:	fd043303          	ld	x6,-48(x8)
+ 34e:	fcc42783          	lw	x15,-52(x8)
+ 352:	8e3e                	mv	x28,x15
+ 354:	fc842783          	lw	x15,-56(x8)
+ 358:	8ebe                	mv	x29,x15
+ 35a:	fc442783          	lw	x15,-60(x8)
+ 35e:	8f3e                	mv	x30,x15
+ 360:	fc042783          	lw	x15,-64(x8)
+ 364:	8fbe                	mv	x31,x15
+ 366:	0de00893          	li	x17,222
+ 36a:	8542                	mv	x10,x16
+ 36c:	859a                	mv	x11,x6
+ 36e:	8672                	mv	x12,x28
+ 370:	86f6                	mv	x13,x29
+ 372:	877a                	mv	x14,x30
+ 374:	87fe                	mv	x15,x31
+ 376:	00000073          	ecall
+ 37a:	882a                	mv	x16,x10
+ 37c:	ff043023          	sd	x16,-32(x8)
+ 380:	fe043783          	ld	x15,-32(x8)
+ 384:	853e                	mv	x10,x15
+ 386:	70e2                	ld	x1,56(x2)
+ 388:	7442                	ld	x8,48(x2)
+ 38a:	6121                	addi	x2,x2,64
+ 38c:	8082                	ret
+
+000000000000038e <_start>:
+ 38e:	1101                	addi	x2,x2,-32
+ 390:	ec06                	sd	x1,24(x2)
+ 392:	e822                	sd	x8,16(x2)
+ 394:	1000                	addi	x8,x2,32
+ 396:	4781                	li	x15,0
+ 398:	577d                	li	x14,-1
+ 39a:	4681                	li	x13,0
+ 39c:	4601                	li	x12,0
+ 39e:	6585                	lui	x11,0x1
+ 3a0:	4501                	li	x10,0
+ 3a2:	f69ff0ef          	jal	30a <mmap>
+ 3a6:	fea43423          	sd	x10,-24(x8)
+ 3aa:	fe843783          	ld	x15,-24(x8)
+ 3ae:	577d                	li	x14,-1
+ 3b0:	e398                	sd	x14,0(x15)
+ 3b2:	4781                	li	x15,0
+ 3b4:	577d                	li	x14,-1
+ 3b6:	4681                	li	x13,0
+ 3b8:	4601                	li	x12,0
+ 3ba:	6585                	lui	x11,0x1
+ 3bc:	4501                	li	x10,0
+ 3be:	f4dff0ef          	jal	30a <mmap>
+ 3c2:	fea43023          	sd	x10,-32(x8)
+ 3c6:	05d00893          	li	x17,93
+ 3ca:	4501                	li	x10,0
+ 3cc:	00000073          	ecall
+ 3d0:	0001                	nop
+ 3d2:	60e2                	ld	x1,24(x2)
+ 3d4:	6442                	ld	x8,16(x2)
+ 3d6:	6105                	addi	x2,x2,32
+ 3d8:	8082                	ret

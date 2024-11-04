@@ -144,7 +144,6 @@ impl Ram {
         let region = self
             .find_region_mut(address)
             .ok_or(MemoryError::InvalidAddress(address))?;
-        trace!("addr: {address:08x}");
         let offset = (address - region.start) as usize;
         region.data[offset] = value;
         Ok(())
