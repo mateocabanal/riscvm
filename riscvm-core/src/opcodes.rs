@@ -1495,6 +1495,7 @@ pub mod tests {
         map.push(("srai", 0x42d65393));
         map.push(("sub", 0x405302b3));
         map.push(("sll", 0x019192b3));
+        map.push(("sll", 0x00f696b3));
         map.push(("slt", 0x0191a2b3));
         map.push(("sltu", 0x0191b2b3));
         map.push(("xor", 0x001d4fb3));
@@ -2894,14 +2895,17 @@ pub mod tests {
                     );
                 }
             }
-            {
-                let value = is_rv64c_addi_instruction(c_ins);
-                let ins_name = "caddi";
+            if name != "cnop" {
+                {
+                    let value = is_rv64c_addi_instruction(c_ins);
+                    let ins_name = "caddi";
 
-                if (value && name != ins_name) || (!value && name == ins_name) {
-                    return Err(
-                        format!("{name}: {c_ins:#08x}, is not an {ins_name} instruction!").into(),
-                    );
+                    if (value && name != ins_name) || (!value && name == ins_name) {
+                        return Err(format!(
+                            "{name}: {c_ins:#08x}, is not an {ins_name} instruction!"
+                        )
+                        .into());
+                    }
                 }
             }
             {

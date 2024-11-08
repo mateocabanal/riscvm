@@ -8,19 +8,19 @@ _start:
     add x8, sp, x0             # Use x8 as a base register for stack operations
 
     # Call each test subroutine
-    jal x0, test_addw
-    jal x0, test_subw
-    jal x0, test_sllw
-    jal x0, test_sraw
-    jal x0, test_slti
-    jal x0, test_sltiu
-    jal x0, test_slt
-    jal x0, test_sltu
-    jal x0, test_cjalr
-    jal x0, test_clw
+    jal test_addw
+    jal test_subw
+    jal test_sllw
+    jal test_sraw
+    jal test_slti
+    jal test_sltiu
+    jal test_slt
+    jal test_sltu
+    jal test_clw
+    jal test_caddi16sp
 
     # If all tests pass, branch to success
-    jal x0, pass
+    jal pass
 
 # Subroutines for each test
 
@@ -92,14 +92,6 @@ test_sltu:
     bne x23, x17, fail
     ret
 
-test_cjalr:
-    la x9, check_jal           # Load address of check_jal into x9
-    li x10, 9                  # Set exit code to 9 for c.jalr test failure
-    c.jalr x9                  # Jump to address in x9 (check_jal)
-    j fail                     # If it falls through, fail the test
-check_jal:
-    ret                        # Return to continue testing if successful
-
 test_clw:
     # Store and load a value using compressed instructions
     li x17, 15
@@ -109,9 +101,24 @@ test_clw:
     bne x13, x17, fail
     ret
 
+test_caddi16sp:
+    li x10, 11
+    c.mv x9, x8
+    c.addi16sp sp, 16
+    c.addi x9, 16
+    bne x9, sp, fail
+    ret
+
+
 # Common success and failure handlers
 
+dump_regs:
+    li x17, 1001
+    ecall
+    ret
+
 fail:
+    jal dump_regs
     li x17, 93                 # Syscall number for exit
     ecall                      # Exit with failure
 

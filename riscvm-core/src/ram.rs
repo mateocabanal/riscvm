@@ -50,7 +50,7 @@ impl Ram {
             .ok_or(MemoryError::InvalidAddress(addr));
 
         let Ok(region) = region else {
-            return region.map(|i| ());
+            return region.map(|_| ());
         };
 
         region.extend(addition);
@@ -58,9 +58,52 @@ impl Ram {
         Ok(())
     }
 
-    pub fn extend_text_region(&mut self, addition: u64) -> Result<(), MemoryError> {
-        let region = self.regions.iter_mut().find(|reg| reg.is_text()).unwrap();
-        region.extend(addition);
+    pub fn find_end_of_text_region(&self) -> u64 {
+        let mut iter = self.regions.iter();
+
+        // There has to be at least 1 region
+        let mut biggest_reg = iter.next().unwrap();
+        for reg in iter {
+            if !reg.is_execute() {
+                continue;
+            }
+            if reg.is_execute() && !biggest_reg.is_execute() {
+                biggest_reg = reg;
+                continue;
+            }
+
+            if reg.start > biggest_reg.start {
+                biggest_reg = reg;
+            }
+        }
+
+        biggest_reg.start + biggest_reg.size
+    }
+
+    pub fn extend_text_region_to(&mut self, addr: u64) -> Result<(), MemoryError> {
+        let mut iter = self.regions.iter_mut();
+
+        // There has to be at least 1 region
+        let mut biggest_reg = iter.next().unwrap();
+        for reg in iter {
+            if !reg.is_execute() {
+                continue;
+            }
+            if reg.is_execute() && !biggest_reg.is_execute() {
+                biggest_reg = reg;
+                continue;
+            }
+
+            if reg.start > biggest_reg.start {
+                biggest_reg = reg;
+            }
+        }
+
+        let Some(offset) = addr.checked_sub(biggest_reg.start + biggest_reg.size) else {
+            return Err(MemoryError::InvalidAddress(u64::MAX));
+        };
+
+        biggest_reg.extend(offset);
 
         Ok(())
     }
@@ -71,7 +114,7 @@ impl Ram {
             .ok_or(MemoryError::InvalidAddress(addr));
 
         let Ok(region) = region else {
-            return region.map(|i| ());
+            return region.map(|_| ());
         };
 
         let index = self
@@ -256,7 +299,7 @@ impl MemoryRegion {
         }
     }
 
-    pub fn is_text(&self) -> bool {
+    pub fn is_execute(&self) -> bool {
         self.flags & 1 == 1
     }
 

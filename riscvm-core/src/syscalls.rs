@@ -1,8 +1,12 @@
 use crate::cpu::RV64GCRegAbiName::*;
 use crate::cpu::RV64GC;
 use crate::ram::MemoryRegion;
+use rand::Rng;
+use tracing::error;
+use tracing::info;
 use tracing::span;
 use tracing::trace;
+use tracing::warn;
 use tracing::Level;
 
 pub fn writev(cpu: &mut RV64GC) {
@@ -71,9 +75,7 @@ pub fn mmap(cpu: &mut RV64GC) {
     let fd = cpu.registers[A4] as i64;
     let offset = cpu.registers[A5];
 
-    println!("mmap\n\taddr: {addr}\n\tlen: {len}\n\tprot: {prot}\n\tflags: {flags}\n\tfd: {fd}\n\toffset: {offset}");
-
-    println!("{}", cpu.registers);
+    trace!("mmap\n\taddr: {addr}\n\tlen: {len}\n\tprot: {prot}\n\tflags: {flags}\n\tfd: {fd}\n\toffset: {offset}");
 
     if len == 0 {
         panic!("mmap called with no len!")
@@ -98,7 +100,86 @@ pub fn mmap(cpu: &mut RV64GC) {
 }
 
 pub fn brk(cpu: &mut RV64GC) {
+    info!("brk");
     let addr = cpu.registers[A0];
-    cpu.ram.extend_text_region(addr).unwrap();
-    cpu.registers[A0] = addr;
+
+    if addr == 0 {
+        cpu.registers[A0] = cpu.ram.find_end_of_text_region();
+        return;
+    }
+
+    if cpu.ram.extend_text_region_to(addr).is_ok() {
+        cpu.registers[A0] = 0;
+    } else {
+        error!("brk failed: 0x:{addr:08x}");
+        cpu.registers[A0] = u64::MAX;
+    }
+}
+
+// 278
+pub fn getrandom(cpu: &mut RV64GC) {
+    let mut rng = rand::thread_rng();
+    let addr = cpu.registers[A0];
+    let len = cpu.registers[A1];
+    let _flags = cpu.registers[A2];
+
+    for i in 0..len {
+        if cpu.ram.write_byte(addr + i, rng.gen()).is_err() {
+            warn!("getrandom failed!");
+            cpu.registers[A0] = u64::MAX;
+            return;
+        }
+    }
+
+    cpu.registers[A0] = 0;
+}
+
+// 172
+pub fn getpid(cpu: &mut RV64GC) {
+    cpu.registers[A0] = std::process::id().into();
+}
+
+// 178
+pub fn gettid(cpu: &mut RV64GC) {
+    getpid(cpu);
+}
+
+// 113
+pub fn clock_gettime(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 135
+pub fn rt_sigprocmask(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 131
+pub fn tgkll(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 261
+pub fn prlimit64(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 134
+pub fn sig_action(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 78
+pub fn readlink(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 226
+pub fn mprotect(cpu: &mut RV64GC) {
+    cpu.registers[A0] = 0;
+}
+
+// 80
+pub fn lstat(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
 }

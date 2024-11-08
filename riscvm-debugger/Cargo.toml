@@ -1,0 +1,10 @@
+[package]
+name = "riscvm-debugger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29.0"
+riscvm-core = { path = "../riscvm-core" }
+tui-popup = "0.6.0"
+tui-prompts = "0.5.0"

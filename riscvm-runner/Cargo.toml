@@ -2,6 +2,7 @@
 name = "riscvm-runner"
 version = "0.1.0"
 edition = "2021"
+default-run = "riscvm-runner"
 
 [dependencies]
 riscvm-core = { path = "../riscvm-core" }
