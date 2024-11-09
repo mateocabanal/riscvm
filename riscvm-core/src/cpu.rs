@@ -1,6 +1,8 @@
 use bit::BitIndex;
 use goblin::elf::Elf;
+use rand::RngCore;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::span;
 use tracing::trace;
@@ -116,10 +118,8 @@ impl RV64GC {
         ram.add_region(stack_region).unwrap();
 
         let mut rand_bytes = [0u8; 16];
-        File::open("/dev/urandom")
-            .unwrap()
-            .read_exact(&mut rand_bytes)
-            .unwrap();
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut rand_bytes);
 
         for b in rand_bytes.iter().rev() {
             sp -= 1;
@@ -420,6 +420,12 @@ impl RV64GC {
                     Clwsp(c_rs1, imm)
                 }
 
+                i if is_rv64c_swsp_instruction(i) => {
+                    let imm = i.bit_range(7..9) << 6 | i.bit_range(9..12) << 2;
+
+                    Cswsp(c_rs2, imm.into())
+                }
+
                 i if is_rv64c_addi4spn_instruction(i) => {
                     let imm = u32::from(i.bit_range(7..11)) << 6
                         | u32::from(i.bit_range(11..13)) << 4
@@ -535,9 +541,17 @@ impl RV64GC {
 
                 i if is_rv64c_addw_instruction(i) => Caddw(x_rs1 + 8, x2_rs1 + 8),
 
+                i if is_rv64c_subw_instruction(i) => Csubw(x_rs1 + 8, x2_rs1 + 8),
+
                 i if is_rv64c_fsd_instruction(i) => {
                     let imm = i.bit_range(5..7) << 6;
                     Cfsd(x_rs1 + 8, x2_rs1 + 8, imm.into())
+                }
+
+                i if is_rv64c_fsdsp_instruction(i) => {
+                    let imm = i.bit_range(7..10) << 6 | i.bit_range(10..12) << 3;
+
+                    Cfsdsp(c_rs2, imm.into())
                 }
 
                 _ => IllegalInstruction(c_ins.into()),
@@ -657,10 +671,10 @@ impl RV64GC {
                     | (i.bit(20) as u32) << 11
                     | i.bit_range(21..31) << 1;
 
-                trace!("offset: {offset:#b}");
-                trace!("offset: {}", crate::sign_extend(offset as u64, 20));
+                let s_offset = sign_extend(offset.into(), 21);
 
-                Jal(rd, offset)
+                trace!("offset: {:#020b}", offset);
+                Jal(rd, s_offset)
             }
 
             i if is_rv64i_jalr_instruction(i) => Jalr(rd, rs1, imm),
@@ -874,6 +888,12 @@ impl RV64GC {
                 Fsd(rs1, rs2, simm)
             }
 
+            i if is_rv64f_fsgnjd_instruction(i) => Fsgnjd(rd, rs1, rs2),
+
+            i if is_rv64f_fcvtds_instruction(i) => Fcvtds(rd, rm, rs1),
+
+            i if is_rv64f_fmvxd_instruction(i) => Fmvxd(rd, rs1),
+
             _ => IllegalInstruction(current_ins),
         }
     }
@@ -886,28 +906,11 @@ impl RV64GC {
         trace!("system call: {syscall_id}");
 
         match syscall_id {
-            64 => {
-                trace!("printing...");
+            62 => lseek(self),
 
-                let ptr = self.registers[A1];
-                let len = self.registers[A2];
+            63 => read(self),
 
-                trace!("ptr: {ptr:#08x}");
-                trace!("len: {len}");
-
-                let msg = (ptr..ptr + len)
-                    .map(|addr| {
-                        self.ram
-                            .read_byte(addr)
-                            .inspect_err(|e| panic!("{e}"))
-                            .unwrap() as char
-                    })
-                    .collect::<String>();
-
-                print!("{msg}");
-
-                self.registers[A0] = len;
-            }
+            64 => write(self),
 
             66 => writev(self),
 
@@ -933,6 +936,8 @@ impl RV64GC {
                 self.registers[A0] = 0;
             }
 
+            98 => futex(self),
+
             // NOTE: set_robust_list
             99 => {
                 self.registers[A0] = 0;
@@ -940,7 +945,7 @@ impl RV64GC {
 
             113 => clock_gettime(self),
 
-            131 => tgkll(self),
+            131 => tgkill(self),
 
             134 => sig_action(self),
 
@@ -954,6 +959,8 @@ impl RV64GC {
             222 => mmap(self),
 
             226 => mprotect(self),
+
+            258 => riscv_hwprobe(self),
 
             261 => prlimit64(self),
 
@@ -1045,7 +1052,7 @@ pub enum RV64GCInstruction {
     Sb(Reg, Reg, Imm),
     Sh(Reg, Reg, Imm),
     Sw(Reg, Reg, Imm),
-    Jal(Reg, Imm),
+    Jal(Reg, Simm),
     Jalr(Reg, Reg, Imm),
     Beq(Reg, Reg, Imm),
     Bne(Reg, Reg, Imm),
@@ -1150,7 +1157,7 @@ pub enum RV64GCInstruction {
     Fled(Reg, Reg, Reg),
     Fclassd(Reg, Reg),
     Fcvtsd(Reg, Reg),
-    Fcvtds(Reg, Reg),
+    Fcvtds(Reg, Reg, Reg),
     Fcvtwd(Reg, Reg),
     Fcvtwud(Reg, Reg),
     Fcvtdwu(Reg, Reg),
@@ -1159,6 +1166,7 @@ pub enum RV64GCInstruction {
     Fsw(Reg, Reg, Imm),
     Fld(Reg, Reg, Imm),
     Fsd(Reg, Reg, Simm),
+    Fmvxd(Reg, Reg),
 
     // NOTE: RV64C
     Cebreak,
@@ -1361,13 +1369,15 @@ impl RV64GCInstruction {
                 todo!()
             }
 
+            // This was previously checking the sign bit at the 4th bit,
+            // absolutely stupid...
             Lb(rd, rs1, imm) => {
                 cpu.registers[rd] = sign_extend(
                     cpu.ram
                         .read_byte((cpu.registers[rs1] as i64 + sign_extend12(*imm)) as u64)
                         .unwrap()
                         .into(),
-                    4,
+                    8,
                 ) as u64;
             }
 
@@ -1458,11 +1468,9 @@ impl RV64GCInstruction {
                     .unwrap();
             }
 
-            Jal(rd, imm) => {
+            Jal(rd, simm) => {
                 let span = span!(Level::TRACE, "jal");
                 let _guard = span.enter();
-
-                let simm = crate::sign_extend(*imm as u64, 20);
 
                 if *rd > 0 {
                     cpu.registers[rd] = cpu.registers[Pc] + 4;
@@ -1577,13 +1585,9 @@ impl RV64GCInstruction {
             }
 
             Sraiw(rd, rs1, shamt) => {
-                debug!("sraiw");
+                trace!("sraiw");
                 let bit_reg = cpu.registers[rs1].bit_range(0..32) as i32;
                 let shifted_reg = sign_extend(u64::from((bit_reg.wrapping_shr(*shamt)) as u32), 32);
-
-                debug!("\trs1: {}", bit_reg);
-                debug!("\tshamt: {shamt}");
-                debug!("\tvalue: {shifted_reg}");
 
                 cpu.registers[rd] = shifted_reg as u64;
             }
@@ -2295,6 +2299,24 @@ impl RV64GCInstruction {
                     .unwrap();
             }
 
+            Fcvtds(rd, rm, rs1) => {
+                let rm = if *rm == 0b111 {
+                    cpu.fcsr.frm
+                } else {
+                    RoundingMode::from(rm)
+                };
+
+                let dbl_precision = f64::from_bits(cpu.float_registers[rs1]);
+                cpu.float_registers[rd] = (round_f32(dbl_precision as f32, rm)).to_bits() as u64;
+            }
+
+            Fmvxd(rd, rs1) => cpu.registers[rd] = cpu.registers[rs1],
+
+            Fsgnjd(rd, rs1, rs2) => {
+                let sign_bit_rem = cpu.float_registers[rs1] & 0x8000000000000000;
+                cpu.float_registers[rd] = sign_bit_rem & cpu.float_registers[rs2];
+            }
+
             // NOTE: RV64C
             Cebreak => panic!("ebreak not implemented!"),
 
@@ -2425,7 +2447,13 @@ impl RV64GCInstruction {
             }
 
             Clwsp(rd, imm) => {
-                let val = cpu.ram.read_word(cpu.registers[Sp] + *imm as u64).unwrap();
+                let val = sign_extend(
+                    cpu.ram
+                        .read_word(cpu.registers[Sp] + *imm as u64)
+                        .unwrap()
+                        .into(),
+                    32,
+                );
                 cpu.registers[rd] = val as u64;
             }
 
@@ -2448,11 +2476,34 @@ impl RV64GCInstruction {
                 cpu.registers[rd] = sign_extend(res & u32::MAX as u64, 32) as u64;
             }
 
+            Csubw(rd, rs1) => {
+                let res = cpu.registers[rd].wrapping_sub(cpu.registers[rs1]);
+
+                cpu.registers[rd] = sign_extend(res & u32::MAX as u64, 32) as u64;
+            }
+
             Cfsd(rs1, rs2, imm) => cpu
                 .ram
                 .write_doubleword(
                     cpu.registers[rs1] + u64::from(*imm),
                     cpu.float_registers[rs2],
+                )
+                .unwrap(),
+
+            Cfsdsp(rs1, imm) => {
+                cpu.ram
+                    .write_doubleword(
+                        cpu.registers[Sp] + u64::from(*imm),
+                        cpu.float_registers[rs1],
+                    )
+                    .unwrap();
+            }
+
+            Cswsp(rs1, offset) => cpu
+                .ram
+                .write_word(
+                    cpu.registers[Sp] + *offset as u64,
+                    cpu.registers[rs1] as u32,
                 )
                 .unwrap(),
 

@@ -189,13 +189,27 @@ fn handle_cmd<'a>(app: &mut App, cpu: &mut RV64GC, cmd: String) -> Popup<'a, Tex
         }
 
         "breakpoint" | "b" => {
-            let (Some(oper), Some(addr)) = (
-                split_cmds.get(1),
-                split_cmds
-                    .get(2)
-                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
-            ) else {
-                return err_popup("Missing operation and/or address!");
+            let Some(oper) = split_cmds.get(1) else {
+                return err_popup("Missing operation!");
+            };
+
+            match *oper {
+                "clear" | "c" => {
+                    app.breakpoints.clear();
+
+                    return Popup::new(Text::from("All breakpoints cleared!").centered())
+                        .title("BREAKPOINT")
+                        .style(style);
+                }
+
+                _ => {}
+            };
+
+            let Some(addr) = split_cmds
+                .get(2)
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            else {
+                return err_popup("Missing address!");
             };
 
             match *oper {
@@ -207,14 +221,6 @@ fn handle_cmd<'a>(app: &mut App, cpu: &mut RV64GC, cmd: String) -> Popup<'a, Tex
                     )
                     .title("BREAKPOINT")
                     .style(style)
-                }
-
-                "clear" | "c" => {
-                    app.breakpoints.clear();
-
-                    Popup::new(Text::from("All breakpoints cleared!").centered())
-                        .title("BREAKPOINT")
-                        .style(style)
                 }
 
                 "delete" | "d" => {
@@ -426,8 +432,6 @@ fn run(mut term: DefaultTerminal, mut cpu: RV64GC, mut app: App) -> io::Result<(
                                 let cmd = app.input.value().to_string();
                                 let popup = handle_cmd(&mut app, &mut cpu, cmd);
                                 app.input_mode = InputMode::Normal;
-                                app.input.value_mut().clear();
-                                app.input.move_start();
 
                                 if let Some(entry) = app.entries.last() {
                                     if app.input.value() != entry {
@@ -438,6 +442,9 @@ fn run(mut term: DefaultTerminal, mut cpu: RV64GC, mut app: App) -> io::Result<(
                                     app.entries.push(app.input.value().to_string());
                                     app.entry_idx += 1;
                                 }
+
+                                app.input.value_mut().clear();
+                                app.input.move_start();
 
                                 app.popup = popup;
                                 app.show_popup = true;

@@ -1,7 +1,12 @@
+use std::io;
+use std::io::Read;
+use std::io::Write;
+
 use crate::cpu::RV64GCRegAbiName::*;
 use crate::cpu::RV64GC;
 use crate::ram::MemoryRegion;
 use rand::Rng;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::span;
@@ -9,6 +14,149 @@ use tracing::trace;
 use tracing::warn;
 use tracing::Level;
 
+enum Errno {
+    EPERM = 1,
+    ENOENT = 2,
+    ESRCH = 3,
+    EINTR = 4,
+    EIO = 5,
+    EBADF = 9,
+    EAGAIN = 11,
+    EACCCES = 13,
+    EFAULT = 14,
+}
+
+impl From<Errno> for i64 {
+    fn from(val: Errno) -> Self {
+        val as u64 as i64
+    }
+}
+
+impl Errno {
+    pub fn into_err(self) -> u64 {
+        let sval: i64 = self.into();
+        -sval as u64
+    }
+}
+
+#[derive(Debug)]
+enum SeekMode {
+    Set = 0,
+    Cur = 1,
+    End = 2,
+}
+
+impl From<i64> for SeekMode {
+    fn from(value: i64) -> Self {
+        match value {
+            0 => SeekMode::Set,
+            1 => SeekMode::Cur,
+            2 => SeekMode::End,
+            _ => panic!("invalid seek mode!"),
+        }
+    }
+}
+
+impl From<SeekMode> for i64 {
+    fn from(value: SeekMode) -> Self {
+        value as i64
+    }
+}
+
+// 63
+pub fn read(cpu: &mut RV64GC) {
+    let span = span!(Level::TRACE, "syscall_read");
+    let _guard = span.enter();
+
+    let fd = cpu.registers[A0];
+    let buf = cpu.registers[A1];
+    let count = cpu.registers[A2];
+
+    debug!("fd: {fd}");
+    debug!("buf: 0x{buf:08x}");
+    debug!("count: {count}");
+
+    if count == 0 {
+        cpu.registers[A0] = 0;
+        return;
+    }
+
+    if fd != 0 {
+        panic!("riscvm only supports the read syscall with the file descriptor 0 (stdin)");
+    }
+
+    let mut buffer = vec![0u8; count as usize];
+
+    if fd == 0 {
+        let bytes_read = match std::io::stdin().read(&mut buffer) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                // Read was interrupted
+                cpu.registers[A0] = Errno::EINTR.into_err();
+                return;
+            }
+            Err(_) => {
+                // Other I/O error
+                cpu.registers[A0] = Errno::EIO.into_err();
+                return;
+            }
+        };
+
+        for (idx, b) in buffer.into_iter().enumerate() {
+            if cpu.ram.write_byte(buf + idx as u64, b).is_err() {
+                cpu.registers[A0] = Errno::EFAULT.into_err();
+                return;
+            }
+        }
+
+        cpu.registers[A0] = bytes_read as u64;
+    }
+}
+
+// 64
+pub fn write(cpu: &mut RV64GC) {
+    let span = span!(Level::TRACE, "syscall_write");
+    let _guard = span.enter();
+
+    debug!("write");
+
+    let ptr = cpu.registers[A1];
+    let len = cpu.registers[A2];
+
+    trace!("ptr: {ptr:#08x}");
+    trace!("len: {len}");
+
+    let msg = if len != 0 {
+        (ptr..ptr + len)
+            .map(|addr| {
+                cpu.ram
+                    .read_byte(addr)
+                    .inspect_err(|e| panic!("{e}"))
+                    .unwrap() as char
+            })
+            .collect::<String>()
+    } else {
+        let mut i = 0;
+        let mut string = String::new();
+        while let Ok(c) = cpu.ram.read_byte(i).map(|i| i as char) {
+            if c == '\0' {
+                break;
+            }
+
+            string.push(c);
+            i += 1;
+        }
+
+        string
+    };
+
+    print!("{msg}");
+
+    std::io::stdout().flush().unwrap();
+    cpu.registers[A0] = len;
+}
+
+// 66
 pub fn writev(cpu: &mut RV64GC) {
     #[derive(Debug)]
     struct Iovec {
@@ -16,7 +164,7 @@ pub fn writev(cpu: &mut RV64GC) {
         iov_len: u64,
     }
 
-    trace!("writev");
+    debug!("writev");
 
     let mut total_bytes_written = 0;
     let fd = cpu.registers[A0];
@@ -61,6 +209,7 @@ pub fn writev(cpu: &mut RV64GC) {
 
     trace!("wrote {total_bytes_written} bytes");
 
+    std::io::stdout().flush().unwrap();
     cpu.registers[A0] = total_bytes_written
 }
 
@@ -75,6 +224,7 @@ pub fn mmap(cpu: &mut RV64GC) {
     let fd = cpu.registers[A4] as i64;
     let offset = cpu.registers[A5];
 
+    debug!("mmap");
     trace!("mmap\n\taddr: {addr}\n\tlen: {len}\n\tprot: {prot}\n\tflags: {flags}\n\tfd: {fd}\n\toffset: {offset}");
 
     if len == 0 {
@@ -100,7 +250,7 @@ pub fn mmap(cpu: &mut RV64GC) {
 }
 
 pub fn brk(cpu: &mut RV64GC) {
-    info!("brk");
+    debug!("brk");
     let addr = cpu.registers[A0];
 
     if addr == 0 {
@@ -155,7 +305,7 @@ pub fn rt_sigprocmask(cpu: &mut RV64GC) {
 }
 
 // 131
-pub fn tgkll(cpu: &mut RV64GC) {
+pub fn tgkill(cpu: &mut RV64GC) {
     cpu.registers[A0] = u64::MAX;
 }
 
@@ -182,4 +332,40 @@ pub fn mprotect(cpu: &mut RV64GC) {
 // 80
 pub fn lstat(cpu: &mut RV64GC) {
     cpu.registers[A0] = u64::MAX;
+}
+
+// 258
+pub fn riscv_hwprobe(cpu: &mut RV64GC) {
+    cpu.registers[A0] = u64::MAX;
+}
+
+// 62
+pub fn lseek(cpu: &mut RV64GC) {
+    let span = span!(Level::TRACE, "lseek");
+    let _guard = span.enter();
+
+    let fd = cpu.registers[A0] as i64;
+    let offset = cpu.registers[A1] as i64;
+    let whence = cpu.registers[A2] as i64;
+    let seek_mode = SeekMode::from(whence);
+
+    trace!("lseek");
+    trace!("fd: {fd}");
+    trace!("offset: {offset}");
+    trace!("seek mode: {seek_mode:?}");
+
+    if fd == 0 {
+        warn!("lseek on stdin is not supported!");
+        cpu.registers[A0] = Errno::EBADF.into_err();
+    } else {
+        warn!("lseek is not yet implemented!");
+        cpu.registers[A0] = Errno::EBADF.into_err();
+    }
+}
+
+// 98
+// https://www.man7.org/linux/man-pages/man2/futex.2.html
+// NOTE: Just return FUTEX_WAIT for now
+pub fn futex(cpu: &mut RV64GC) {
+    cpu.registers[A0] = 0;
 }
