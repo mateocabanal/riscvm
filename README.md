@@ -41,5 +41,5 @@ cargo install --git https://github.com/mateocabanal/riscvm riscvm-debugger # Ins
 - [X] Support statically linked binaries
 - [X] Start libc (gets to `int main()` when using libc)
 - [X] Start libstdc++ (gets to `int main()` when using libstdc++ (C++))
-- [] Start Rust (gets to `fn main()` when using Rust) [see issue](https://github.com/mateocabanal/riscvm/issues/2)
-- [] Support dynamically linked binaries 
+- [ ] Start Rust (gets to `fn main()` when using Rust) [see issue](https://github.com/mateocabanal/riscvm/issues/2)
+- [ ] Support dynamically linked binaries 
