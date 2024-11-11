@@ -40,7 +40,7 @@ cargo install --git https://github.com/mateocabanal/riscvm riscvm-debugger # Ins
 
 `riscvm <ELF_FILE>`
 
-<h2> To-Do List </h2>
+<h2> Features </h2>
 
 - [X] ELF execution
 - [X] Support statically linked binaries
