@@ -33,6 +33,7 @@ cargo install --git https://github.com/mateocabanal/riscvm riscvm-debugger // In
 ```
 
 <h2> To-Do List </h2>
+
 - [X] ELF execution
 - [X] Support statically linked binaries
 - [X] Start libc (gets to `int main()` when using libc)
