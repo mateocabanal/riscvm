@@ -26,11 +26,14 @@
 <h2> Installation </h2>
 
 ```bash
-cargo install --git https://github.com/mateocabanal/riscvm riscvm-runner // Installs the 'riscvm' binary
+cargo install --git https://github.com/mateocabanal/riscvm riscvm-runner # Installs the 'riscvm' binary
 
-// OPTIONAL
-cargo install --git https://github.com/mateocabanal/riscvm riscvm-debugger // Installs the 'riscvm-debugger' binary
+# OPTIONAL
+cargo install --git https://github.com/mateocabanal/riscvm riscvm-debugger # Installs the 'riscvm-debugger' binary
 ```
+<h2> Usage </h2>
+
+`riscvm <ELF_FILE>`
 
 <h2> To-Do List </h2>
 
