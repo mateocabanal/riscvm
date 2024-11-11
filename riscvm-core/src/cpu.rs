@@ -130,7 +130,7 @@ impl RV64GC {
 
         let mut argv_ptrs = vec![];
 
-        for arg in args.iter().skip(1).rev() {
+        for arg in args.iter().skip(2).rev() {
             sp -= 1;
             ram.write_byte(sp, 0).unwrap();
             for c in arg.bytes().rev() {
@@ -140,6 +140,16 @@ impl RV64GC {
 
             argv_ptrs.push(sp);
         }
+
+        let path_name = args.get(1).unwrap().split('/').last().unwrap();
+        sp -= 1;
+        ram.write_byte(sp, 0).unwrap();
+        for c in path_name.bytes().rev() {
+            sp -= 1;
+            ram.write_byte(sp, c).unwrap();
+        }
+
+        argv_ptrs.push(sp);
 
         // NOTE: Leave 10kb of extra space for vars
         sp = 0x7FFF_FFFF_FFFF_FA00;
@@ -166,7 +176,7 @@ impl RV64GC {
         // // If there were environment variables, we would push their addresses here
 
         self.registers[Sp] = sp;
-        sp = self.write_auxv_to_stack(elf, phdr_addr, rand_ptr, argv_ptrs[0]);
+        sp = self.write_auxv_to_stack(elf, phdr_addr, rand_ptr, *argv_ptrs.last().unwrap());
 
         let ram = &mut self.ram;
 
@@ -421,7 +431,7 @@ impl RV64GC {
                 }
 
                 i if is_rv64c_swsp_instruction(i) => {
-                    let imm = i.bit_range(7..9) << 6 | i.bit_range(9..12) << 2;
+                    let imm = i.bit_range(7..9) << 6 | i.bit_range(9..13) << 2;
 
                     Cswsp(c_rs2, imm.into())
                 }
@@ -544,12 +554,12 @@ impl RV64GC {
                 i if is_rv64c_subw_instruction(i) => Csubw(x_rs1 + 8, x2_rs1 + 8),
 
                 i if is_rv64c_fsd_instruction(i) => {
-                    let imm = i.bit_range(5..7) << 6;
+                    let imm = i.bit_range(5..7) << 6 | i.bit_range(10..13) << 3;
                     Cfsd(x_rs1 + 8, x2_rs1 + 8, imm.into())
                 }
 
                 i if is_rv64c_fsdsp_instruction(i) => {
-                    let imm = i.bit_range(7..10) << 6 | i.bit_range(10..12) << 3;
+                    let imm = i.bit_range(7..10) << 6 | i.bit_range(10..13) << 3;
 
                     Cfsdsp(c_rs2, imm.into())
                 }
@@ -2318,7 +2328,7 @@ impl RV64GCInstruction {
             }
 
             // NOTE: RV64C
-            Cebreak => panic!("ebreak not implemented!"),
+            Cebreak => panic!("c.ebreak not implemented!"),
 
             Cjalr(rs1) => {
                 cpu.registers[Ra] = cpu.registers[Pc] + 2;

@@ -14,6 +14,7 @@ use tracing::trace;
 use tracing::warn;
 use tracing::Level;
 
+#[allow(unused, clippy::upper_case_acronyms)]
 enum Errno {
     EPERM = 1,
     ENOENT = 2,
@@ -22,6 +23,7 @@ enum Errno {
     EIO = 5,
     EBADF = 9,
     EAGAIN = 11,
+    ENOMEM = 12,
     EACCCES = 13,
     EFAULT = 14,
 }
@@ -252,7 +254,6 @@ pub fn mmap(cpu: &mut RV64GC) {
 pub fn brk(cpu: &mut RV64GC) {
     debug!("brk");
     let addr = cpu.registers[A0];
-
     if addr == 0 {
         cpu.registers[A0] = cpu.ram.find_end_of_text_region();
         return;
@@ -262,7 +263,7 @@ pub fn brk(cpu: &mut RV64GC) {
         cpu.registers[A0] = 0;
     } else {
         error!("brk failed: 0x:{addr:08x}");
-        cpu.registers[A0] = u64::MAX;
+        cpu.registers[A0] = Errno::ENOMEM.into_err();
     }
 }
 
