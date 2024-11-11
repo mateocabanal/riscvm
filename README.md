@@ -1,7 +1,12 @@
 <div align="center" id="user-content-toc">
   <ul align="center" style="list-style: none;">
     <summary>
-      <h1 align="center"> RISCVM </h1>
+      <h1 align="center"> 
+        RISCVM 
+        <a href="https://github.com/mateocabanal/riscvm/actions/workflows/rust.yml">
+          <img align="center" src="https://github.com/mateocabanal/riscvm/actions/workflows/rust.yml/badge.svg" />
+        </a>
+      </h1>
     </summary>
   </ul>
 </div>
