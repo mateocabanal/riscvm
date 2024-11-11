@@ -7,6 +7,7 @@
 // variadic arguments work) For now, you have to separate the printf calls
 int main() {
   char name[50];
+  printf("What is your name? ");
   scanf("%s", name);
   printf("Hello, ");
   printf("%s\n", name);

@@ -1,8 +1,6 @@
 use bit::BitIndex;
 use goblin::elf::Elf;
 use rand::RngCore;
-use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::span;
 use tracing::trace;
@@ -19,8 +17,6 @@ use crate::sign_extend;
 use crate::sign_extend12;
 use crate::syscalls::*;
 use std::fmt::Display;
-use std::fs::File;
-use std::io::Read;
 use std::ops::{Index, IndexMut};
 
 use crate::cpu::RV64GCRegAbiName::*;
@@ -31,20 +27,26 @@ type Simm = i64;
 type Csr = u16;
 
 const AT_NULL: u64 = 0; // End of auxv
+#[allow(dead_code)]
 const AT_IGNORE: u64 = 1; // Ignore entry
+#[allow(dead_code)]
 const AT_EXECFD: u64 = 2; // File descriptor of program
 const AT_PHDR: u64 = 3; // Program headers address
 const AT_PHENT: u64 = 4; // Size of program header entries
 const AT_PHNUM: u64 = 5; // Number of program header entries
 const AT_PAGESZ: u64 = 6; // System page size
+#[allow(dead_code)]
 const AT_BASE: u64 = 7; // Interpreter base address
+#[allow(dead_code)]
 const AT_FLAGS: u64 = 8; // Flags
 const AT_ENTRY: u64 = 9; // Program entry point address
 const AT_UID: u64 = 11; // Real user ID
 const AT_EUID: u64 = 12; // Effective user ID
 const AT_GID: u64 = 13; // Real group ID
 const AT_EGID: u64 = 14; // Effective group ID
+#[allow(dead_code)]
 const AT_PLATFORM: u64 = 15; // Platform string address
+#[allow(dead_code)]
 const AT_HWCAP: u64 = 16; // Hardware capabilities
 const AT_CLKTCK: u64 = 17; // Clock ticks per second
 const AT_SECURE: u64 = 23; // Secure mode boolean
@@ -128,6 +130,18 @@ impl RV64GC {
 
         let rand_ptr = sp;
 
+        let mut envp_ptrs = vec![];
+
+        // Push host environment vars to stack
+        for (k, v) in std::env::vars() {
+            for c in format!("{k}={v}\0").bytes().rev() {
+                sp -= 1;
+                ram.write_byte(sp, c).unwrap();
+            }
+
+            envp_ptrs.push(sp);
+        }
+
         let mut argv_ptrs = vec![];
 
         for arg in args.iter().skip(2).rev() {
@@ -152,28 +166,10 @@ impl RV64GC {
         argv_ptrs.push(sp);
 
         // NOTE: Leave 10kb of extra space for vars
-        sp = 0x7FFF_FFFF_FFFF_FA00;
+        sp &= !0xF;
 
         // NOTE: Let go of the mutable borrow for now
         let _ = ram;
-
-        // Ensure sp is 16-byte aligned
-
-        // sp -= 8;
-        // ram.write_byte(sp, args.len() as u8).unwrap();
-        // for arg in args {
-        //     let len = arg.len() as u64;
-        //     sp -= len;
-        //     for (i, c) in arg.chars().enumerate() {
-        //         ram.write_byte(sp + i as u64, c as u8).unwrap();
-        //     }
-        //     ram.write_byte(sp + len, 0).unwrap();
-        // }
-        //
-        // // Push NULL terminator for envp (since we have no environment variables)
-        // ram.write_doubleword(sp, 0).unwrap();
-        //
-        // // If there were environment variables, we would push their addresses here
 
         self.registers[Sp] = sp;
         sp = self.write_auxv_to_stack(elf, phdr_addr, rand_ptr, *argv_ptrs.last().unwrap());
@@ -183,6 +179,12 @@ impl RV64GC {
         // Push NULL terminator for envp
         sp -= 8;
         ram.write_doubleword(sp, 0).unwrap();
+
+        // FIXME: Thows a 'malloc(): corrupted top size'
+        // for i in envp_ptrs {
+        //     sp -= 8;
+        //     ram.write_doubleword(sp, i).unwrap();
+        // }
 
         // Push NULL terminator for argv
         sp -= 8;
@@ -582,15 +584,15 @@ impl RV64GC {
                 Lui(rd, sign_extend(ov_imm.into(), 32))
             }
 
-            i if is_rv64i_slti_instruction(i) => Slti(rd, rs1, imm),
+            i if is_rv64i_slti_instruction(i) => Slti(rd, rs1, sign_extend12(imm)),
 
             i if is_rv64i_sltiu_instruction(i) => Sltiu(rd, rs1, imm),
 
-            i if is_rv64i_xori_instruction(i) => Xori(rd, rs1, imm),
+            i if is_rv64i_xori_instruction(i) => Xori(rd, rs1, sign_extend12(imm)),
 
-            i if is_rv64i_ori_instruction(i) => Ori(rd, rs1, imm),
+            i if is_rv64i_ori_instruction(i) => Ori(rd, rs1, sign_extend12(imm)),
 
-            i if is_rv64i_andi_instruction(i) => Andi(rd, rs1, imm),
+            i if is_rv64i_andi_instruction(i) => Andi(rd, rs1, sign_extend12(imm)),
 
             i if is_rv64i_slli_instruction(i) => {
                 let shamt = i.bit_range(20..26);
@@ -629,11 +631,11 @@ impl RV64GC {
                 Fence(i.bit_range(20..24) as u8, i.bit_range(24..28) as u8)
             }
 
-            i if is_rv64i_lb_instruction(i) => Lb(rd, rs1, imm),
+            i if is_rv64i_lb_instruction(i) => Lb(rd, rs1, sign_extend12(imm)),
 
-            i if is_rv64i_lbu_instruction(i) => Lbu(rd, rs1, imm),
+            i if is_rv64i_lbu_instruction(i) => Lbu(rd, rs1, sign_extend12(imm)),
 
-            i if is_rv64i_lhu_instruction(i) => Lhu(rd, rs1, imm),
+            i if is_rv64i_lhu_instruction(i) => Lhu(rd, rs1, sign_extend12(imm)),
 
             i if is_rv64i_sb_instruction(i) => {
                 let lo_offset = i.bit_range(7..12);
@@ -641,7 +643,7 @@ impl RV64GC {
 
                 let offset = (hi_offset << 5) | lo_offset;
 
-                Sb(rs1, rs2, offset)
+                Sb(rs1, rs2, sign_extend12(offset))
             }
 
             i if is_rv64i_sh_instruction(i) => {
@@ -650,7 +652,7 @@ impl RV64GC {
 
                 let offset = (hi_offset << 5) | lo_offset;
 
-                Sh(rs1, rs2, offset)
+                Sh(rs1, rs2, sign_extend12(offset))
             }
 
             i if is_rv64i_lw_instruction(i) => Lw(rd, rs1, sign_extend12(imm)),
@@ -661,7 +663,7 @@ impl RV64GC {
 
                 let offset = (hi_offset << 5) | lo_offset;
 
-                Sw(rs1, rs2, offset)
+                Sw(rs1, rs2, sign_extend12(offset))
             }
 
             i if is_rv64i_ld_instruction(i) => Ld(rd, rs1, sign_extend12(imm)),
@@ -672,7 +674,7 @@ impl RV64GC {
 
                 let offset = (hi_offset << 5) | lo_offset;
 
-                Sd(rs1, rs2, offset)
+                Sd(rs1, rs2, sign_extend12(offset))
             }
 
             i if is_rv64i_jal_instruction(i) => {
@@ -687,7 +689,7 @@ impl RV64GC {
                 Jal(rd, s_offset)
             }
 
-            i if is_rv64i_jalr_instruction(i) => Jalr(rd, rs1, imm),
+            i if is_rv64i_jalr_instruction(i) => Jalr(rd, rs1, sign_extend12(imm)),
 
             i if is_rv64i_bge_instruction(i) => {
                 let offset = (i.bit(31) as u32) << 12
@@ -1022,11 +1024,11 @@ pub enum RV64GCInstruction {
     Addi(Reg, Reg, Simm),
     Auipc(Reg, Simm),
     Lui(Reg, Simm),
-    Slti(Reg, Reg, Imm),
+    Slti(Reg, Reg, Simm),
     Sltiu(Reg, Reg, Imm),
-    Xori(Reg, Reg, Imm),
-    Ori(Reg, Reg, Imm),
-    Andi(Reg, Reg, Imm),
+    Xori(Reg, Reg, Simm),
+    Ori(Reg, Reg, Simm),
+    Andi(Reg, Reg, Simm),
     Slli(Reg, Reg, Imm),
     Srli(Reg, Reg, Imm),
     Srai(Reg, Reg, Imm),
@@ -1054,16 +1056,16 @@ pub enum RV64GCInstruction {
     Mret,
     Wfi,
     SfenceVma(Reg, Reg, Reg),
-    Lb(Reg, Reg, Imm),
-    Lh(Reg, Reg, Imm),
+    Lb(Reg, Reg, Simm),
+    Lh(Reg, Reg, Simm),
     Lw(Reg, Reg, Simm),
-    Lbu(Reg, Reg, Imm),
-    Lhu(Reg, Reg, Imm),
-    Sb(Reg, Reg, Imm),
-    Sh(Reg, Reg, Imm),
-    Sw(Reg, Reg, Imm),
+    Lbu(Reg, Reg, Simm),
+    Lhu(Reg, Reg, Simm),
+    Sb(Reg, Reg, Simm),
+    Sh(Reg, Reg, Simm),
+    Sw(Reg, Reg, Simm),
     Jal(Reg, Simm),
-    Jalr(Reg, Reg, Imm),
+    Jalr(Reg, Reg, Simm),
     Beq(Reg, Reg, Imm),
     Bne(Reg, Reg, Imm),
     Blt(Reg, Reg, Imm),
@@ -1072,7 +1074,7 @@ pub enum RV64GCInstruction {
     Bgeu(Reg, Reg, Imm),
     IllegalInstruction(u32),
     Ld(Reg, Reg, Simm),
-    Sd(Reg, Reg, Imm),
+    Sd(Reg, Reg, Simm),
     Addiw(Reg, Reg, Imm),
     Slliw(Reg, Reg, Imm),
     Srliw(Reg, Reg, Imm),
@@ -1250,11 +1252,10 @@ impl RV64GCInstruction {
                 cpu.registers[rd] = *simm as u64;
             }
 
-            Slti(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm);
+            Slti(rd, rs1, simm) => {
                 let rs1 = cpu.registers[rs1] as i64;
 
-                if rs1 < simm {
+                if rs1 < *simm {
                     cpu.registers[rd] = 1;
                 } else {
                     cpu.registers[rd] = 0;
@@ -1271,24 +1272,18 @@ impl RV64GCInstruction {
                 }
             }
 
-            Xori(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm) as u64;
-
-                cpu.registers[rd] = cpu.registers[rs1] ^ simm;
+            Xori(rd, rs1, simm) => {
+                cpu.registers[rd] = cpu.registers[rs1] ^ *simm as u64;
             }
 
-            Ori(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm) as u64;
-
-                cpu.registers[rd] = cpu.registers[rs1] | simm;
+            Ori(rd, rs1, simm) => {
+                cpu.registers[rd] = cpu.registers[rs1] | *simm as u64;
             }
 
-            Andi(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm) as u64;
-
+            Andi(rd, rs1, simm) => {
                 trace!("andi {} & {simm}", cpu.registers[rs1]);
 
-                cpu.registers[rd] = cpu.registers[rs1] & simm;
+                cpu.registers[rd] = cpu.registers[rs1] & *simm as u64;
             }
 
             Slli(rd, rs1, imm) => {
@@ -1300,8 +1295,7 @@ impl RV64GCInstruction {
             }
 
             Srai(rd, rs1, imm) => {
-                cpu.registers[rd] =
-                    ((cpu.registers[rs1] as i64).wrapping_shr(sign_extend12(*imm) as u32)) as u64;
+                cpu.registers[rd] = (cpu.registers[rs1] as i64).wrapping_shr(*imm) as u64;
             }
 
             Sub(rd, rs1, rs2) => {
@@ -1381,22 +1375,21 @@ impl RV64GCInstruction {
 
             // This was previously checking the sign bit at the 4th bit,
             // absolutely stupid...
-            Lb(rd, rs1, imm) => {
+            Lb(rd, rs1, simm) => {
                 cpu.registers[rd] = sign_extend(
                     cpu.ram
-                        .read_byte((cpu.registers[rs1] as i64 + sign_extend12(*imm)) as u64)
+                        .read_byte((cpu.registers[rs1] as i64 + simm) as u64)
                         .unwrap()
                         .into(),
                     8,
                 ) as u64;
             }
 
-            Lbu(rd, rs1, offset) => {
-                let simm = sign_extend12(*offset);
+            Lbu(rd, rs1, simm) => {
                 trace!("lbu simm: {simm}");
                 cpu.registers[rd] = cpu
                     .ram
-                    .read_byte(cpu.registers[rs1].wrapping_add_signed(simm))
+                    .read_byte(cpu.registers[rs1].wrapping_add_signed(*simm))
                     .unwrap()
                     .into();
             }
@@ -1408,26 +1401,23 @@ impl RV64GCInstruction {
                     .unwrap()
             }
 
-            Sb(rs1, rs2, imm) => {
-                let simm = sign_extend12(*imm);
-                let addr = (cpu.registers[rs1] as i64).wrapping_add(simm);
+            Sb(rs1, rs2, simm) => {
+                let addr = (cpu.registers[rs1] as i64).wrapping_add(*simm);
 
                 cpu.ram
                     .write_byte(addr as u64, cpu.registers[rs2] as u8)
                     .unwrap();
             }
 
-            Sh(rs1, rs2, imm) => {
-                let simm = sign_extend12(*imm);
-                let addr = (cpu.registers[rs1] as i64).wrapping_add(simm);
+            Sh(rs1, rs2, simm) => {
+                let addr = (cpu.registers[rs1] as i64).wrapping_add(*simm);
                 let value = cpu.registers[rs2] as u16;
 
                 cpu.ram.write_halfword(addr as u64, value as u64).unwrap();
             }
 
-            Lh(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm);
-                let addr = (cpu.registers[rs1] as i64).wrapping_add(simm);
+            Lh(rd, rs1, simm) => {
+                let addr = (cpu.registers[rs1] as i64).wrapping_add(*simm);
 
                 cpu.registers[rd] =
                     sign_extend(cpu.ram.read_halfword(addr as u64).unwrap(), 16) as u64;
@@ -1444,8 +1434,7 @@ impl RV64GCInstruction {
                 ) as u64;
             }
 
-            Sw(rs1, rs2, imm) => {
-                let simm = sign_extend12(*imm);
+            Sw(rs1, rs2, simm) => {
                 let addr = cpu.registers[rs1] as i64 + simm;
 
                 cpu.ram
@@ -1466,14 +1455,13 @@ impl RV64GCInstruction {
                     .unwrap();
             }
 
-            Sd(rs1, rs2, imm) => {
-                let simm = sign_extend12(*imm);
-                let addr = cpu.registers[rs1].wrapping_add_signed(simm);
+            Sd(rs1, rs2, simm) => {
+                let addr = cpu.registers[rs1].wrapping_add_signed(*simm);
 
                 trace!("sd addr: {addr:08x}");
 
                 cpu.ram
-                    .write_doubleword(addr as u64, cpu.registers[rs2])
+                    .write_doubleword(addr, cpu.registers[rs2])
                     .inspect_err(|e| panic!("{e}\nAddress: {:08x}", cpu.registers[rs1]))
                     .unwrap();
             }
@@ -1492,9 +1480,8 @@ impl RV64GCInstruction {
                 cpu.registers[Pc] -= 4;
             }
 
-            Jalr(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm);
-                let jump_addr = (cpu.registers[rs1] as i64).wrapping_add(simm);
+            Jalr(rd, rs1, simm) => {
+                let jump_addr = (cpu.registers[rs1] as i64).wrapping_add(*simm);
 
                 if *rd > 0 {
                     cpu.registers[rd] = cpu.registers[Pc] + 4;
@@ -2563,8 +2550,7 @@ impl Display for RV64GCInstruction {
                 write!(f, "ecall")
             }
 
-            Sd(rs1, rs2, offset) => {
-                let simm = sign_extend12(*offset);
+            Sd(rs1, rs2, simm) => {
                 write!(f, "sd x{rs2}, {simm}(x{rs1})")
             }
 
