@@ -199,13 +199,15 @@ pub fn writev(cpu: &mut RV64GC) {
             }
         }
 
-        if let Ok(s) = String::from_utf8(val) {
+        if let Ok(s) = std::str::from_utf8(&val) {
             match fd {
                 2 => eprint!("\x1b[31m{s}\x1b[0m"),
                 _ => {
                     print!("{s}");
                 }
             }
+        } else {
+            panic!("writev not a string!");
         }
     }
 

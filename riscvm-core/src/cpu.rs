@@ -109,6 +109,70 @@ impl RV64GC {
         sp
     }
 
+    fn initialize_stack_with_ext_lib(&mut self, elf: Elf, phdr_addr: Option<u64>) {
+        use linux_libc_auxv::{AuxVar, AuxVarFlags, InitialLinuxLibcStackLayoutBuilder};
+
+        let stack_top = 0x7FFF_FFFF_FFFF_FFF0;
+        let stack_size: u64 = 8 * 1024 * 1024; // 8 MB
+        let stack_start = stack_top - stack_size;
+        let ram = &mut self.ram;
+        let stack_region = MemoryRegion::new(stack_start, stack_size, vec![0; stack_size as usize]);
+        ram.add_region(stack_region).unwrap();
+
+        let mut builder = InitialLinuxLibcStackLayoutBuilder::new();
+
+        let args_vec = std::env::args().skip(1).collect::<Vec<String>>();
+
+        let prog_name = args_vec.first().unwrap();
+
+        builder.arg_v.push(prog_name);
+        for arg in &args_vec[1..] {
+            builder.arg_v.push(arg);
+        }
+
+        // let envp_vec = std::env::vars()
+        //     .map(|(k, v)| format!("{k}={v}"))
+        //     .collect::<Vec<String>>();
+        // for s in envp_vec.iter() {
+        //     builder.env_v.push(s);
+        // }
+
+        let mut rand_bytes = [0u8; 16];
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut rand_bytes);
+        let auxv = [
+            AuxVar::Phdr(phdr_addr.unwrap() as *const u8),
+            AuxVar::Phent(elf.header.e_phentsize.into()),
+            AuxVar::Phnum(elf.header.e_phnum.into()),
+            AuxVar::Pagesz(4096),
+            AuxVar::Entry(elf.header.e_entry as *const u8),
+            AuxVar::Uid(1000),
+            AuxVar::Gid(1000),
+            AuxVar::EUid(1000),
+            AuxVar::EGid(1000),
+            AuxVar::Secure(false),
+            AuxVar::Random(rand_bytes),
+            AuxVar::Clktck(100),
+            AuxVar::Flags(AuxVarFlags::empty()),
+            AuxVar::ExecFn(prog_name),
+        ];
+
+        auxv.into_iter().for_each(|e| {
+            builder.aux_v.insert(e);
+        });
+
+        let mut stack_bytes = vec![0u8; builder.total_size()];
+        let low_addr = stack_top - builder.total_size() as u64;
+        unsafe {
+            builder.serialize_into_buf(stack_bytes.as_mut_slice(), low_addr);
+        }
+
+        for (idx, byte) in stack_bytes.into_iter().enumerate() {
+            self.ram.write_byte(low_addr + idx as u64, byte).unwrap();
+        }
+        self.registers[Sp] = low_addr;
+    }
+
     fn initialize_stack(&mut self, elf: Elf, phdr_addr: Option<u64>) {
         let ram = &mut self.ram;
         let args = std::env::args().collect::<Vec<String>>();
@@ -141,6 +205,8 @@ impl RV64GC {
 
             envp_ptrs.push(sp);
         }
+
+        sp &= !0xF;
 
         let mut argv_ptrs = vec![];
 
@@ -180,7 +246,7 @@ impl RV64GC {
         sp -= 8;
         ram.write_doubleword(sp, 0).unwrap();
 
-        // FIXME: Thows a 'malloc(): corrupted top size'
+        // FIXME: Throws a 'malloc(): corrupted top size'
         // for i in envp_ptrs {
         //     sp -= 8;
         //     ram.write_doubleword(sp, i).unwrap();
@@ -247,7 +313,7 @@ impl RV64GC {
                     let v_addr = ph.p_vaddr;
                     if ph.p_offset == 0 {
                         // HACK: Is it guaranteed to start 64 bytes ahead??!!
-                        ehdr = Some(v_addr + 64);
+                        ehdr = Some(v_addr + elf.header.e_phoff);
                     }
                     let mem_size = ph.p_memsz;
 
@@ -273,7 +339,7 @@ impl RV64GC {
             }
         }
 
-        self.initialize_stack(elf, ehdr);
+        self.initialize_stack_with_ext_lib(elf, ehdr);
         self.elf_bin = bin;
 
         trace!("mem regions: {}", self.ram);
@@ -1263,9 +1329,7 @@ impl RV64GCInstruction {
             }
 
             Sltiu(rd, rs1, imm) => {
-                let simm = sign_extend12(*imm) as u64;
-
-                if cpu.registers[rs1] < simm {
+                if cpu.registers[rs1] < *imm as u64 {
                     cpu.registers[rd] = 1;
                 } else {
                     cpu.registers[rd] = 0;
@@ -1376,29 +1440,44 @@ impl RV64GCInstruction {
             // This was previously checking the sign bit at the 4th bit,
             // absolutely stupid...
             Lb(rd, rs1, simm) => {
-                cpu.registers[rd] = sign_extend(
-                    cpu.ram
-                        .read_byte((cpu.registers[rs1] as i64 + simm) as u64)
-                        .unwrap()
-                        .into(),
-                    8,
-                ) as u64;
+                let res = cpu
+                    .ram
+                    .read_byte(cpu.registers[rs1].wrapping_add_signed(*simm));
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = sign_extend(res.into(), 8) as u64;
             }
 
             Lbu(rd, rs1, simm) => {
-                trace!("lbu simm: {simm}");
-                cpu.registers[rd] = cpu
+                let res = cpu
                     .ram
-                    .read_byte(cpu.registers[rs1].wrapping_add_signed(*simm))
-                    .unwrap()
-                    .into();
+                    .read_byte(cpu.registers[rs1].wrapping_add_signed(*simm));
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+                cpu.registers[rd] = res.into();
             }
 
-            Lhu(rd, rs1, offset) => {
-                cpu.registers[rd] = cpu
+            Lhu(rd, rs1, simm) => {
+                let res = cpu
                     .ram
-                    .read_halfword(cpu.registers[rs1] + *offset as u64)
-                    .unwrap()
+                    .read_halfword(cpu.registers[rs1].wrapping_add_signed(*simm));
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = res;
             }
 
             Sb(rs1, rs2, simm) => {
@@ -1417,21 +1496,31 @@ impl RV64GCInstruction {
             }
 
             Lh(rd, rs1, simm) => {
-                let addr = (cpu.registers[rs1] as i64).wrapping_add(*simm);
+                let res = cpu
+                    .ram
+                    .read_halfword(cpu.registers[rs1].wrapping_add_signed(*simm));
 
-                cpu.registers[rd] =
-                    sign_extend(cpu.ram.read_halfword(addr as u64).unwrap(), 16) as u64;
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = sign_extend(res, 16) as u64;
             }
 
             Lw(rd, rs1, simm) => {
-                cpu.registers[rd] = sign_extend(
-                    cpu.ram
-                        .read_word((cpu.registers[rs1] as i64 + simm) as u64)
-                        .inspect_err(|e| panic!("{e}"))
-                        .unwrap()
-                        .into(),
-                    32,
-                ) as u64;
+                let res = cpu
+                    .ram
+                    .read_word(cpu.registers[rs1].wrapping_add_signed(*simm));
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = sign_extend(res.into(), 32) as u64;
             }
 
             Sw(rs1, rs2, simm) => {
@@ -1564,7 +1653,7 @@ impl RV64GCInstruction {
 
             Addiw(rd, rs1, imm) => {
                 let simm = sign_extend12(*imm);
-                let value = (cpu.registers[rs1] as i64).wrapping_add(simm) & (u32::MAX as i64);
+                let value = (cpu.registers[rs1] as i32).wrapping_add(simm as i32);
 
                 cpu.registers[rd] = sign_extend(value as u64, 32) as u64;
             }
@@ -1590,17 +1679,17 @@ impl RV64GCInstruction {
             }
 
             Addw(rd, rs1, rs2) => {
-                let rs1_low = cpu.registers[rs1] & (u32::MAX as u64);
-                let rs2_low = cpu.registers[rs2] & (u32::MAX as u64);
+                let rs1_low = (cpu.registers[rs1] & (u32::MAX as u64)) as i32;
+                let rs2_low = (cpu.registers[rs2] & (u32::MAX as u64)) as i32;
 
-                cpu.registers[rd] = sign_extend(rs1_low.wrapping_add(rs2_low), 32) as u64;
+                cpu.registers[rd] = sign_extend(rs1_low.wrapping_add(rs2_low) as u64, 32) as u64;
             }
 
             Subw(rd, rs1, rs2) => {
-                let rs1_low = cpu.registers[rs1] & (u32::MAX as u64);
-                let rs2_low = cpu.registers[rs2] & (u32::MAX as u64);
+                let rs1_low = (cpu.registers[rs1] & (u32::MAX as u64)) as i32;
+                let rs2_low = (cpu.registers[rs2] & (u32::MAX as u64)) as i32;
 
-                cpu.registers[rd] = sign_extend(rs1_low.wrapping_sub(rs2_low), 32) as u64;
+                cpu.registers[rd] = sign_extend(rs1_low.wrapping_sub(rs2_low) as u64, 32) as u64;
             }
 
             Sllw(rd, rs1, rs2) => {
@@ -2307,7 +2396,7 @@ impl RV64GCInstruction {
                 cpu.float_registers[rd] = (round_f32(dbl_precision as f32, rm)).to_bits() as u64;
             }
 
-            Fmvxd(rd, rs1) => cpu.registers[rd] = cpu.registers[rs1],
+            Fmvxd(rd, rs1) => cpu.registers[rd] = cpu.float_registers[rs1],
 
             Fsgnjd(rd, rs1, rs2) => {
                 let sign_bit_rem = cpu.float_registers[rs1] & 0x8000000000000000;
@@ -2338,10 +2427,17 @@ impl RV64GCInstruction {
 
             Cmv(rd, rs1) => cpu.registers[rd] = cpu.registers[rs1],
 
-            Cldsp(rs1, imm) => {
-                let addr = cpu.registers[Sp] + (*imm) as u64;
-                trace!("c.ldsp: {addr:08x}");
-                cpu.registers[rs1] = cpu.ram.read_doubleword(addr).unwrap();
+            Cldsp(rd, imm) => {
+                let addr = cpu.registers[Sp] + *imm as u64;
+                let res = cpu.ram.read_doubleword(addr);
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = res;
             }
 
             Caddi4spn(rd, imm) => cpu.registers[rd] = cpu.registers[Sp] + u64::from(*imm),
@@ -2359,17 +2455,26 @@ impl RV64GCInstruction {
             Cslli(rd, imm) => cpu.registers[rd] = cpu.registers[rd].wrapping_shl(*imm),
 
             Csdsp(rs1, imm) => {
-                let addr = cpu.registers[Sp] + u64::from(*imm);
-                cpu.ram.write_doubleword(addr, cpu.registers[rs1]).unwrap();
+                let offset = cpu.registers[Sp].wrapping_add(*imm as u64);
+                let res = cpu.ram.write_doubleword(offset, cpu.registers[rs1]);
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
             }
 
             Cld(rd, rs1, imm) => {
-                let val = cpu
+                let res = cpu
                     .ram
-                    .read_doubleword(cpu.registers[rs1] + u64::from(*imm))
-                    .unwrap();
+                    .read_doubleword(cpu.registers[rs1].wrapping_add(*imm as u64));
 
-                cpu.registers[rd] = val;
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = res;
             }
 
             Caddi(rd, simm) => {
@@ -2399,12 +2504,12 @@ impl RV64GCInstruction {
             }
 
             Csd(rs1, rs2, imm) => {
-                cpu.ram
-                    .write_doubleword(
-                        cpu.registers[rs1].wrapping_add(*imm as u64),
-                        cpu.registers[rs2],
-                    )
-                    .unwrap();
+                let offset = cpu.registers[rs1].wrapping_add(*imm as u64);
+                let res = cpu.ram.write_doubleword(offset, cpu.registers[rs2]);
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
             }
 
             Clui(rd, imm) => {
@@ -2424,9 +2529,12 @@ impl RV64GCInstruction {
             }
 
             Csw(rs1, rs2, imm) => {
-                cpu.ram
-                    .write_word(cpu.registers[rs1] + *imm as u64, cpu.registers[rs2] as u32)
-                    .unwrap();
+                let offset = cpu.registers[rs1].wrapping_add(*imm as u64);
+                let res = cpu.ram.write_word(offset, cpu.registers[rs2] as u32);
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
             }
 
             Csrli(rd, imm) => {
@@ -2440,17 +2548,22 @@ impl RV64GCInstruction {
             Caddiw(rd, simm) => {
                 let rd_val = cpu.registers[rd] as i64 as i32;
 
-                cpu.registers[rd] = rd_val.wrapping_add(*simm as i32) as u64;
+                cpu.registers[rd] =
+                    sign_extend(rd_val.wrapping_add(*simm as i32) as u64, 32) as u64;
             }
 
             Clwsp(rd, imm) => {
-                let val = sign_extend(
-                    cpu.ram
-                        .read_word(cpu.registers[Sp] + *imm as u64)
-                        .unwrap()
-                        .into(),
-                    32,
-                );
+                let res = cpu
+                    .ram
+                    .read_word(cpu.registers[Sp].wrapping_add(*imm as u64));
+
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                let val = sign_extend(res.into(), 32);
                 cpu.registers[rd] = val as u64;
             }
 
@@ -2461,22 +2574,30 @@ impl RV64GCInstruction {
             }
 
             Clw(rd, rs1, imm) => {
-                let offset = cpu.registers[rs1] + *imm as u64;
+                let offset = cpu.registers[rs1].wrapping_add(*imm as u64);
+                let res = cpu.ram.read_word(offset);
 
-                cpu.registers[rd] =
-                    sign_extend(cpu.ram.read_word(offset).unwrap().into(), 32) as u64;
+                if let Err(res) = res {
+                    panic!("{}", res);
+                }
+
+                let res = res.unwrap();
+
+                cpu.registers[rd] = sign_extend(res.into(), 32) as u64;
             }
 
             Caddw(rd, rs1) => {
-                let res = cpu.registers[rd].wrapping_add(cpu.registers[rs1]);
+                let rd_val = cpu.registers[rd] as i32;
+                let rs1_val = cpu.registers[rs1] as i32;
 
-                cpu.registers[rd] = sign_extend(res & u32::MAX as u64, 32) as u64;
+                cpu.registers[rd] = rd_val.wrapping_add(rs1_val) as i64 as u64;
             }
 
             Csubw(rd, rs1) => {
-                let res = cpu.registers[rd].wrapping_sub(cpu.registers[rs1]);
+                let rd_val = cpu.registers[rd] as i32;
+                let rs1_val = cpu.registers[rs1] as i32;
 
-                cpu.registers[rd] = sign_extend(res & u32::MAX as u64, 32) as u64;
+                cpu.registers[rd] = rd_val.wrapping_sub(rs1_val) as i64 as u64;
             }
 
             Cfsd(rs1, rs2, imm) => cpu

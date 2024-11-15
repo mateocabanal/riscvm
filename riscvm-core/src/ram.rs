@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use thiserror::Error;
 use tracing::trace;
 
 #[derive(Debug)]
@@ -309,9 +310,9 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum MemoryError {
-    #[error("Invalid address: {0:08x}")]
+    #[error("Invalid address: 0x{0:016x}")]
     InvalidAddress(u64),
     #[error("Permission denied at address: 0x{0:X}")]
     PermissionDenied(u64),

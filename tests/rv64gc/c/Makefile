@@ -5,5 +5,9 @@ PROGS = $(patsubst %.c,%,$(SRCS))
 
 all: $(PROGS)
 
+clean:
+	rm -r bin
+
 %: %.c
-	$(CC) $(CFLAGS)  -o $@ $<
+	mkdir -p bin
+	$(CC) $(CFLAGS) -o bin/$@ $<
