@@ -1713,38 +1713,34 @@ impl RV64GCInstruction {
                 let addr = (cpu.registers[rs1] as i64).wrapping_add(sign_extend12(*offset));
                 let mem = cpu.ram.read_word(addr as u64).unwrap();
 
-                cpu.registers[rd] = sign_extend(u64::from(mem), 32) as u64;
+                cpu.registers[rd] = u64::from(mem);
             }
 
             Mul(rd, rs1, rs2) => {
-                let value = (cpu.registers[rs1] as i64).wrapping_mul(cpu.registers[rs2] as i64);
+                let value = (cpu.registers[rs1] as i64 as i128)
+                    .wrapping_mul(cpu.registers[rs2] as i64 as i128);
 
-                cpu.registers[rd] = (value & i32::MAX as i64) as u64;
+                cpu.registers[rd] = value as u64;
             }
 
             Mulh(rd, rs1, rs2) => {
-                let h_multiplicand = (cpu.registers[rs1] >> 32) as i64;
-                let h_multiplier = (cpu.registers[rs2] >> 32) as i64;
+                let value = (cpu.registers[rs1] as i64 as i128)
+                    .wrapping_mul(cpu.registers[rs2] as i64 as i128);
 
-                cpu.registers[rd] = h_multiplicand.wrapping_mul(h_multiplier) as u64;
+                cpu.registers[rd] = (value >> 64) as u64;
             }
 
             Mulhsu(rd, rs1, rs2) => {
-                let h_multiplicand = cpu.registers[rs1] >> 32;
-                let h_multiplier = (cpu.registers[rs2] >> 32) as i64;
-                let result: u64 = if h_multiplier.is_negative() {
-                    (h_multiplicand as i64).wrapping_mul(h_multiplier) as u64
-                } else {
-                    h_multiplicand.wrapping_mul(h_multiplier as u64)
-                };
+                let value = (cpu.registers[rs1] as i64 as i128)
+                    .wrapping_mul(cpu.registers[rs2] as u64 as i128);
 
-                cpu.registers[rd] = result;
+                cpu.registers[rd] = (value >> 64) as u64;
             }
 
             Mulhu(rd, rs1, rs2) => {
-                let h_multiplicand = cpu.registers[rs1] >> 32;
-                let h_multiplier = cpu.registers[rs2] >> 32;
-                cpu.registers[rd] = h_multiplicand.wrapping_mul(h_multiplier);
+                let value = (cpu.registers[rs1] as u128)
+                    .wrapping_mul(cpu.registers[rs2] as u128);
+                cpu.registers[rd] = (value >> 64) as u64;
             }
 
             Div(rd, rs1, rs2) => {
@@ -1780,7 +1776,7 @@ impl RV64GCInstruction {
                 let dividend = cpu.registers[rs1] as i64;
                 let divisor = cpu.registers[rs2] as i64;
                 if divisor == 0 {
-                    cpu.registers[rd] = u64::MAX;
+                    cpu.registers[rd] = dividend as u64;
                     return;
                 }
 
@@ -1797,7 +1793,7 @@ impl RV64GCInstruction {
                 let dividend = cpu.registers[rs1];
                 let divisor = cpu.registers[rs2];
                 if divisor == 0 {
-                    cpu.registers[rd] = u64::MAX;
+                    cpu.registers[rd] = dividend;
                     return;
                 }
 
@@ -1806,7 +1802,8 @@ impl RV64GCInstruction {
             }
 
             Mulw(rd, rs1, rs2) => {
-                let result = (cpu.registers[rs1] as i64).wrapping_mul(cpu.registers[rs2] as i64);
+                let result = (cpu.registers[rs1] as i32 as i64)
+                    .wrapping_mul(cpu.registers[rs2] as i32 as i64);
 
                 cpu.registers[rd] = sign_extend((result as u64) & u32::MAX as u64, 32) as u64;
             }
@@ -1817,6 +1814,11 @@ impl RV64GCInstruction {
 
                 if signed_rs2 == 0 {
                     cpu.registers[rd] = u64::MAX;
+                    return;
+                }
+
+                if signed_rs1 == i32::MIN && signed_rs2 == -1 {
+                    cpu.registers[rd] = sign_extend(i32::MIN as u64, 32) as u64;
                     return;
                 }
 
@@ -1842,7 +1844,12 @@ impl RV64GCInstruction {
                 let signed_rs2 = (cpu.registers[rs2] & (u32::MAX as u64)) as i32;
 
                 if signed_rs2 == 0 {
-                    cpu.registers[rd] = u64::MAX;
+                    cpu.registers[rd] = sign_extend(signed_rs1 as u64, 32) as u64;
+                    return;
+                }
+
+                if signed_rs1 == i32::MIN && signed_rs2 == -1 {
+                    cpu.registers[rd] = 0;
                     return;
                 }
 
@@ -1855,7 +1862,7 @@ impl RV64GCInstruction {
                 let unsigned_rs2 = (cpu.registers[rs2] & (u32::MAX as u64)) as u32;
 
                 if unsigned_rs2 == 0 {
-                    cpu.registers[rd] = u64::MAX;
+                    cpu.registers[rd] = sign_extend(unsigned_rs1 as u64, 32) as u64;
                     return;
                 }
 
