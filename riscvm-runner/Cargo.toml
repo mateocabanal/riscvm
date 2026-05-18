@@ -13,6 +13,6 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 name = "riscvm"
 path = "src/main.rs"
 
-[profile.release]
-lto = true
-opt-level = 3
+[[bin]]
+name = "riscvm-runner"
+path = "src/bin/riscvm-runner.rs"

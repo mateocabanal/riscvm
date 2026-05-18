@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
-members = [
-  "riscvm-core"
-, "riscvm-debugger", "riscvm-runner"]
+members = ["riscvm-core", "riscvm-debugger", "riscvm-runner"]
+
+[profile.release]
+lto = true
+opt-level = 3

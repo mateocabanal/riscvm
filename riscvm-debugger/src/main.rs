@@ -1,21 +1,13 @@
-use std::{
-    collections::HashSet,
-    fs::File,
-    io::{self, Read},
-};
+use std::io;
 
-use layout::Flex;
 use ratatui::{
-    crossterm::{
-        self,
-        event::{self, KeyCode, KeyEventKind, KeyModifiers},
-    },
+    crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers},
     prelude::*,
     style::Stylize,
-    widgets::{Block, Borders, Cell, List, Padding, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal,
 };
-use riscvm_core::cpu::{RV64GCInstruction, RV64GC};
+use riscvm_debugger::debugger::{load_debugger_from_path, CommandOutput, Debugger};
 use tui_popup::Popup;
 use tui_prompts::{Prompt, State, TextPrompt, TextState};
 
@@ -26,18 +18,17 @@ enum InputMode {
 }
 
 struct App<'a> {
-    pub input: TextState<'a>,
-    pub input_mode: InputMode,
-    pub show_popup: bool,
-    pub popup: Popup<'a, Text<'a>>,
-    pub entries: Vec<String>,
-    pub entry_idx: usize,
-
-    pub breakpoints: Vec<u64>,
+    input: TextState<'a>,
+    input_mode: InputMode,
+    show_popup: bool,
+    popup: Popup<'a, Text<'a>>,
+    entries: Vec<String>,
+    entry_idx: usize,
+    should_quit: bool,
 }
 
 impl<'a> App<'a> {
-    pub fn new() -> App<'a> {
+    fn new() -> App<'a> {
         let mut input = TextState::new();
         input.focus();
         App {
@@ -47,350 +38,168 @@ impl<'a> App<'a> {
             popup: Popup::new(Text::from("")),
             entries: Vec::new(),
             entry_idx: 0,
-            breakpoints: vec![],
+            should_quit: false,
         }
+    }
+
+    fn show_message(&mut self, title: &'static str, message: impl Into<String>, color: Color) {
+        self.popup = Popup::new(Text::from(message.into()))
+            .title(title)
+            .style(Style::new().fg(color).bg(Color::from_u32(0x202436)));
+        self.show_popup = true;
     }
 }
 
 fn main() -> io::Result<()> {
-    let mut cpu = RV64GC::new();
-    let Some(path) = std::env::args().nth(1) else {
-        panic!("No elf file passed!");
+    let cli = match parse_cli(std::env::args().skip(1)) {
+        Ok(ParseResult::Run(cli)) => cli,
+        Ok(ParseResult::Help) => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!();
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
     };
+    let debugger = load_debugger_from_path(&cli.path, cli.guest_args)?;
 
-    let mut buf = Vec::new();
-    File::open(path).unwrap().read_to_end(&mut buf).unwrap();
-
-    cpu.load_elf(buf).unwrap();
-
-    let app = App::new();
+    if cli.batch {
+        return run_batch(debugger, cli.commands);
+    }
 
     let mut term = ratatui::init();
     term.clear()?;
-    let app_result = run(term, cpu, app);
+    let app_result = run(term, debugger, App::new());
     ratatui::restore();
     app_result
 }
 
-fn update_ins_table(cpu: &RV64GC, ins_count: usize) -> Vec<(u64, RV64GCInstruction)> {
-    let mut ins_vec = Vec::new();
+#[derive(Debug, PartialEq, Eq)]
+struct Cli {
+    path: String,
+    guest_args: Vec<String>,
+    batch: bool,
+    commands: Vec<String>,
+}
 
-    let mut pc = cpu.registers[32];
-    for _ in 0..ins_count {
-        let ins = cpu.ram.read_word(pc).unwrap_or(0x00000013);
-        let dec = cpu.find_instruction(ins);
-        ins_vec.push((pc, dec));
+#[derive(Debug)]
+enum ParseResult {
+    Run(Cli),
+    Help,
+}
 
-        if ins & 3 != 3 {
-            pc += 2;
-        } else {
-            pc += 4;
+fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
+    let mut batch = false;
+    let mut commands = Vec::new();
+    let mut path = None;
+    let mut guest_args = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if path.is_some() {
+            guest_args.push(arg);
+            guest_args.extend(args);
+            break;
+        }
+
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(ParseResult::Help),
+            "--batch" => batch = true,
+            "-ex" | "--execute" | "--command" => {
+                let Some(command) = args.next() else {
+                    return Err(format!("{arg} requires a debugger command"));
+                };
+                batch = true;
+                commands.push(command);
+            }
+            "--" => {
+                let Some(binary) = args.next() else {
+                    return Err("-- requires a binary path".to_string());
+                };
+                path = Some(binary);
+                guest_args.extend(args);
+                break;
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
+            _ => path = Some(arg),
         }
     }
 
-    ins_vec
-}
-
-fn jump_to_point(
-    cpu: &mut RV64GC,
-    app: &mut App,
-    table_state: &TableState,
-    ins_vec: &[(u64, RV64GCInstruction)],
-) {
-    let Some(selected_ins) = table_state.selected() else {
-        return;
+    let Some(path) = path else {
+        return Err("missing binary path".to_string());
     };
 
-    let selection = ins_vec[selected_ins];
-
-    if cpu.registers[32] == selection.0 {
-        cpu.step();
-        return;
-    }
-
-    while cpu.registers[32] != selection.0 {
-        if app.breakpoints.contains(&cpu.registers[32]) {
-            app.popup = Popup::new(Text::from(format!(
-                "Breakpoint at {:x} hit!",
-                cpu.registers[32]
-            )))
-            .title("BREAKPOINT")
-            .style(Style::new().fg(Color::Yellow).bg(Color::from_u32(0x3b3f63)));
-            app.show_popup = true;
-            return;
-        }
-
-        cpu.step();
-    }
+    Ok(ParseResult::Run(Cli {
+        path,
+        guest_args,
+        batch,
+        commands,
+    }))
 }
 
-fn handle_cmd<'a>(app: &mut App, cpu: &mut RV64GC, cmd: String) -> Popup<'a, Text<'a>> {
-    let split_cmds = cmd.split_whitespace().collect::<Vec<_>>();
-
-    let bg_color = Color::from_u32(0x3b3f63);
-    let style = Style::new().bg(bg_color);
-
-    let err_popup = |text| {
-        Popup::new(Text::from(text).centered())
-            .style(Style::new().fg(Color::Red).bg(bg_color))
-            .title("Command")
+fn run_batch(mut debugger: Debugger, commands: Vec<String>) -> io::Result<()> {
+    let commands = if commands.is_empty() {
+        vec!["status".to_string()]
+    } else {
+        commands
     };
 
-    if split_cmds.is_empty() {
-        return err_popup("Invalid Command!");
+    for command in commands {
+        println!("riscvm-debugger> {command}");
+        let output = debugger.execute_command(&command);
+        println!("{}", output.message);
+        if output.should_quit {
+            break;
+        }
     }
-
-    match split_cmds[0] {
-        "mem" => {
-            let (Some(oper), Some(str_addr)) = (split_cmds.get(1), split_cmds.get(2)) else {
-                return err_popup("Missing operation and/or address!");
-            };
-            match *oper {
-                "read" => {
-                    let offset = split_cmds
-                        .get(3)
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-
-                    let addr = if str_addr.starts_with("x") {
-                        str_addr
-                            .trim_start_matches("x")
-                            .parse::<u8>()
-                            .map(|i| cpu.registers[&i])
-                    } else {
-                        u64::from_str_radix(str_addr.trim_start_matches("0x"), 16)
-                    };
-
-                    let Ok(addr) = addr else {
-                        return err_popup("Invalid address!\nPlease use a hex address");
-                    };
-
-                    let value = cpu.ram.read_doubleword(addr.wrapping_add_signed(offset));
-
-                    let Ok(value) = value else {
-                        return err_popup("This addresss has not been mapped!");
-                    };
-
-                    Popup::new(
-                        Text::from(format!("{str_addr} + {offset} -> 0x{value:016x}")).centered(),
-                    )
-                    .title("MEMORY")
-                    .style(style)
-                }
-                _ => err_popup("Invalid Command!"),
-            }
-        }
-
-        "reset" => {
-            cpu.reset();
-            Popup::new(Text::from("cpu has been reset!").centered())
-                .title("CPU")
-                .style(style)
-        }
-
-        "breakpoint" | "b" => {
-            let Some(oper) = split_cmds.get(1) else {
-                return err_popup("Missing operation!");
-            };
-
-            match *oper {
-                "clear" | "c" => {
-                    app.breakpoints.clear();
-
-                    return Popup::new(Text::from("All breakpoints cleared!").centered())
-                        .title("BREAKPOINT")
-                        .style(style);
-                }
-
-                _ => {}
-            };
-
-            let Some(addr) = split_cmds
-                .get(2)
-                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            else {
-                return err_popup("Missing address!");
-            };
-
-            match *oper {
-                "set" | "s" => {
-                    app.breakpoints.push(addr);
-
-                    Popup::new(
-                        Text::from(format!("Breakpoint at {:08x} is now set!", addr)).centered(),
-                    )
-                    .title("BREAKPOINT")
-                    .style(style)
-                }
-
-                "delete" | "d" => {
-                    let result = app.breakpoints.iter().position(|i| *i == addr);
-
-                    if let Some(pos) = result {
-                        app.breakpoints.remove(pos);
-
-                        Popup::new(
-                            Text::from(format!("Breakpoint at {addr:08x} removed!")).centered(),
-                        )
-                        .title("BREAKPOINT")
-                        .style(style)
-                    } else {
-                        err_popup("No breakpoint found!")
-                    }
-                }
-
-                _ => err_popup("Invalid operation!"),
-            }
-        }
-
-        "cont" | "c" => {
-            if split_cmds.len() == 1 {
-                while !app.breakpoints.contains(&cpu.registers[32]) {
-                    cpu.step();
-                }
-
-                return Popup::new(Text::from(format!(
-                    "Breakpoint at {:x} hit!",
-                    cpu.registers[32]
-                )))
-                .title("BREAKPOINT")
-                .style(Style::new().fg(Color::Yellow).bg(Color::from_u32(0x3b3f63)));
-            }
-
-            let (Some(oper), Some(str_addr)) = (split_cmds.get(1), split_cmds.get(2)) else {
-                return err_popup("Missing operation and/or address!");
-            };
-
-            match *oper {
-                "unchanged" => {
-                    if str_addr.starts_with("x") {
-                        let Ok(reg_num) = str_addr.trim_start_matches("x").parse::<u8>() else {
-                            return err_popup("Invalid Register!");
-                        };
-
-                        let og_copy = cpu.registers[&reg_num];
-                        while cpu.registers[&reg_num] == og_copy {
-                            cpu.step();
-                        }
-                    } else {
-                        let Ok(addr) = u64::from_str_radix(str_addr.trim_start_matches("0x"), 16)
-                        else {
-                            return err_popup("Invalid Address!");
-                        };
-
-                        let Ok(og_copy) = cpu.ram.read_doubleword(addr) else {
-                            return err_popup("Address has not been mapped!");
-                        };
-
-                        while og_copy == cpu.ram.read_doubleword(addr).unwrap() {
-                            cpu.step();
-                        }
-                    };
-                    Popup::new(Text::from(format!("at {str_addr} now!")).centered()).style(style)
-                }
-                "to" => {
-                    let addr = u64::from_str_radix(str_addr.trim_start_matches("0x"), 16);
-
-                    let Ok(addr) = addr else {
-                        return err_popup("Invalid address!\nPlease use a hex address");
-                    };
-
-                    while cpu.registers[32] != addr {
-                        cpu.step();
-                    }
-
-                    Popup::new(Text::from(format!("at {str_addr} now!")).centered()).style(style)
-                }
-                _ => err_popup("Invalid Operation!"),
-            }
-        }
-        _ => err_popup("Invalid Command!"),
-    }
+    Ok(())
 }
 
-fn run(mut term: DefaultTerminal, mut cpu: RV64GC, mut app: App) -> io::Result<()> {
+fn usage() -> &'static str {
+    "Usage:
+  riscvm-debugger <binary> [guest-args...]
+  riscvm-debugger --batch -ex <command> [-ex <command>...] <binary> [guest-args...]
+
+Options:
+  --batch                 run commands without starting the TUI
+  -ex, --execute <cmd>    execute one debugger command; implies --batch
+  -h, --help              show this help"
+}
+
+fn run(mut term: DefaultTerminal, mut debugger: Debugger, mut app: App) -> io::Result<()> {
     let mut table_state = TableState::default();
     table_state.select_first();
 
     loop {
-        let ins_rows = update_ins_table(&cpu, 50);
-        let rows = ins_rows
-            .clone()
-            .into_iter()
-            .map(|i| Row::new(vec![format!("0x{:08x}", i.0), format!("{}", i.1)]))
+        if app.should_quit {
+            return Ok(());
+        }
+
+        let instructions = debugger
+            .disassemble_from(debugger.pc(), 50)
+            .unwrap_or_else(|_| Vec::new());
+        let rows = instructions
+            .iter()
+            .map(|instruction| {
+                let marker = if debugger.breakpoints().contains(&instruction.address) {
+                    "B"
+                } else {
+                    ""
+                };
+                Row::new(vec![
+                    Cell::from(marker),
+                    Cell::from(format!("0x{:016x}", instruction.address)),
+                    Cell::from(format!("0x{:08x}", instruction.opcode)),
+                    Cell::from(instruction.text.clone()),
+                ])
+            })
             .collect::<Vec<Row>>();
 
-        let row_widths = [Constraint::Length(20), Constraint::Length(20)];
-        let reg_widths = [Constraint::Length(5), Constraint::Percentage(100)];
-
         term.draw(|frame| {
-            let show_popup = app.show_popup;
-            let style = if show_popup {
-                Style::new().fg(Color::from_u32(0x555555))
-            } else {
-                Style::new()
-            };
-
-            let vert_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(vec![Constraint::Percentage(100), Constraint::Min(1)])
-                .split(frame.area());
-
-            let layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![Constraint::Percentage(35), Constraint::Percentage(65)])
-                .split(vert_layout[0]);
-
-            let mut reg_items = (0..32)
-                .map(|i| {
-                    Row::new(vec![
-                        Text::from(format!("x{i}:")),
-                        Text::from(format!("0x{:08x}", cpu.registers[i])),
-                    ])
-                })
-                .collect::<Vec<Row>>();
-
-            reg_items.push(Row::new(vec![
-                Text::from("pc:").fg(Color::from_u32(0x999cf0)),
-                Text::from(format!("0x{:08x}", cpu.registers[32])).fg(Color::from_u32(0x999cf0)),
-            ]));
-
-            let reg_list = Table::new(reg_items, reg_widths).block(
-                Block::new()
-                    .title_top(Line::from("REGISTERS").centered())
-                    .borders(Borders::ALL)
-                    .padding(Padding::new(4, 4, 1, 1))
-                    .style(style),
-            );
-
-            let table = Table::new(rows, row_widths)
-                .header(
-                    Row::new(vec![
-                        Cell::from("Location").style(Style::new().fg(Color::Red)),
-                        Cell::from("Instruction").style(Style::new().fg(Color::Red)),
-                    ])
-                    .on_dark_gray(),
-                )
-                .block(
-                    Block::new()
-                        .title_top(Line::from("INSTRUCTIONS").centered())
-                        .borders(Borders::ALL)
-                        .style(style),
-                )
-                .flex(Flex::SpaceAround)
-                .row_highlight_style(Style::new().bg(Color::from_u32(0x32502c)))
-                .highlight_symbol(">>");
-
-            frame.render_widget(reg_list, layout[0]);
-            frame.render_stateful_widget(table, layout[1], &mut table_state);
-
-            if app.input_mode == InputMode::Insert {
-                TextPrompt::from(":").draw(frame, vert_layout[1], &mut app.input);
-            }
-
-            if show_popup {
-                frame.render_widget(&app.popup, frame.area());
-            }
+            draw(frame, &debugger, &mut app, &mut table_state, rows.clone());
         })?;
 
         if let event::Event::Key(key) = event::read()? {
@@ -402,20 +211,42 @@ fn run(mut term: DefaultTerminal, mut cpu: RV64GC, mut app: App) -> io::Result<(
                     }
                     if key.kind == KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Char('q') => {
-                                return Ok(());
-                            }
-                            KeyCode::Char('n') => {
-                                cpu.step();
-
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('n') | KeyCode::Char('s') => {
+                                let stop = debugger.step(1);
+                                app.show_message("STEP", stop.message(), Color::Cyan);
                                 table_state.select_first();
                             }
-                            KeyCode::Char('i') => app.input_mode = InputMode::Insert,
-                            KeyCode::Char(':') => app.input_mode = InputMode::Insert,
+                            KeyCode::Char('c') => {
+                                let stop = debugger.continue_execution();
+                                app.show_message("CONTINUE", stop.message(), Color::Yellow);
+                                table_state.select_first();
+                            }
+                            KeyCode::Char('i') | KeyCode::Char(':') => {
+                                app.input_mode = InputMode::Insert;
+                            }
                             KeyCode::Down => table_state.select_next(),
                             KeyCode::Up => table_state.select_previous(),
                             KeyCode::Enter => {
-                                jump_to_point(&mut cpu, &mut app, &table_state, &ins_rows)
+                                if let Some(selected) = table_state.selected() {
+                                    if let Some(instruction) = instructions.get(selected) {
+                                        let output = if debugger.pc() == instruction.address {
+                                            CommandOutput {
+                                                message: debugger.step(1).message(),
+                                                should_quit: false,
+                                            }
+                                        } else {
+                                            CommandOutput {
+                                                message: debugger
+                                                    .run_until_pc(instruction.address)
+                                                    .message(),
+                                                should_quit: false,
+                                            }
+                                        };
+                                        apply_command_output(&mut app, output);
+                                        table_state.select_first();
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -424,60 +255,305 @@ fn run(mut term: DefaultTerminal, mut cpu: RV64GC, mut app: App) -> io::Result<(
                 InputMode::Insert => {
                     if key.kind == KeyEventKind::Press {
                         match (key.code, key.modifiers) {
-                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                                app.input_mode = InputMode::Normal
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                                app.input_mode = InputMode::Normal;
                             }
-
                             (KeyCode::Enter, _) => {
                                 let cmd = app.input.value().to_string();
-                                let popup = handle_cmd(&mut app, &mut cpu, cmd);
+                                push_history(&mut app, &cmd);
+                                let output = debugger.execute_command(&cmd);
                                 app.input_mode = InputMode::Normal;
-
-                                if let Some(entry) = app.entries.last() {
-                                    if app.input.value() != entry {
-                                        app.entries.push(app.input.value().to_string());
-                                        app.entry_idx += 1;
-                                    }
-                                } else {
-                                    app.entries.push(app.input.value().to_string());
-                                    app.entry_idx += 1;
-                                }
-
                                 app.input.value_mut().clear();
                                 app.input.move_start();
-
-                                app.popup = popup;
-                                app.show_popup = true;
+                                apply_command_output(&mut app, output);
+                                table_state.select_first();
                             }
-
-                            (KeyCode::Up, _) => {
-                                if let Some(entry) = app.entries.get(app.entry_idx) {
-                                    *app.input.value_mut() = entry.clone();
-                                }
-
-                                if app.entry_idx != 0 {
-                                    app.entry_idx -= 1;
-                                }
-                            }
-
-                            (KeyCode::Down, _) => {
-                                if let Some(entry) = app.entries.get(app.entry_idx) {
-                                    *app.input.value_mut() = entry.clone();
-                                } else {
-                                    app.input.value_mut().clear();
-                                }
-
-                                if app.entry_idx < app.entries.len() {
-                                    app.entry_idx += 1;
-                                }
-                            }
-
-                            (KeyCode::Esc, _) => app.input_mode = InputMode::Normal,
+                            (KeyCode::Up, _) => history_prev(&mut app),
+                            (KeyCode::Down, _) => history_next(&mut app),
                             _ => app.input.handle_key_event(key),
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn draw(
+    frame: &mut Frame<'_>,
+    debugger: &Debugger,
+    app: &mut App<'_>,
+    table_state: &mut TableState,
+    rows: Vec<Row<'_>>,
+) {
+    let show_popup = app.show_popup;
+    let style = if show_popup {
+        Style::new().fg(Color::from_u32(0x555555))
+    } else {
+        Style::new()
+    };
+
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(1)])
+        .split(frame.area());
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(43), Constraint::Min(60)])
+        .split(root[0]);
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Min(10),
+        ])
+        .split(body[0]);
+
+    frame.render_widget(status_panel(debugger).style(style), left[0]);
+    frame.render_widget(debugger_lists(debugger).style(style), left[1]);
+    frame.render_widget(register_table(debugger).style(style), left[2]);
+    frame.render_stateful_widget(instruction_table(rows).style(style), body[1], table_state);
+
+    if app.input_mode == InputMode::Insert {
+        TextPrompt::from(":").draw(frame, root[1], &mut app.input);
+    } else {
+        let hint =
+            Paragraph::new("n/s step | c continue | enter run to selected | : command | q quit")
+                .style(Style::new().fg(Color::DarkGray));
+        frame.render_widget(hint, root[1]);
+    }
+
+    if show_popup {
+        frame.render_widget(&app.popup, frame.area());
+    }
+}
+
+fn status_panel(debugger: &Debugger) -> Paragraph<'static> {
+    let stop = debugger
+        .last_stop()
+        .map_or_else(|| "ready".to_string(), |stop| stop.message());
+    Paragraph::new(format!(
+        "pc: 0x{:016x}\nbreakpoints: {}\nwatchpoints: {}\n{}",
+        debugger.pc(),
+        debugger.breakpoints().len(),
+        debugger.watchpoints().len(),
+        stop
+    ))
+    .block(
+        Block::new()
+            .title_top(Line::from("STATUS").centered())
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1)),
+    )
+    .wrap(Wrap { trim: true })
+}
+
+fn debugger_lists(debugger: &Debugger) -> Paragraph<'static> {
+    let breakpoints = if debugger.breakpoints().is_empty() {
+        "breakpoints: none".to_string()
+    } else {
+        format!(
+            "breakpoints: {}",
+            debugger
+                .breakpoints()
+                .iter()
+                .map(|address| format!("0x{address:016x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let watchpoints = if debugger.watchpoints().is_empty() {
+        "watchpoints: none".to_string()
+    } else {
+        format!(
+            "watchpoints: {}",
+            debugger
+                .watchpoints()
+                .iter()
+                .map(|watch| format!("#{}", watch.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Paragraph::new(format!("{breakpoints}\n{watchpoints}"))
+        .block(
+            Block::new()
+                .title_top(Line::from("STOPS").centered())
+                .borders(Borders::ALL)
+                .padding(Padding::horizontal(1)),
+        )
+        .wrap(Wrap { trim: true })
+}
+
+fn register_table(debugger: &Debugger) -> Table<'static> {
+    let reg_widths = [Constraint::Length(7), Constraint::Length(20)];
+    let mut rows = (0..32)
+        .map(|index| {
+            Row::new(vec![
+                Cell::from(format!("x{index}:")),
+                Cell::from(format!("0x{:016x}", debugger.cpu().registers[index])),
+            ])
+        })
+        .collect::<Vec<Row>>();
+
+    rows.push(Row::new(vec![
+        Cell::from("pc:").fg(Color::from_u32(0x999cf0)),
+        Cell::from(format!("0x{:016x}", debugger.pc())).fg(Color::from_u32(0x999cf0)),
+    ]));
+
+    Table::new(rows, reg_widths).block(
+        Block::new()
+            .title_top(Line::from("REGISTERS").centered())
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 1, 1, 1)),
+    )
+}
+
+fn instruction_table(rows: Vec<Row<'_>>) -> Table<'_> {
+    let widths = [
+        Constraint::Length(2),
+        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Min(24),
+    ];
+
+    Table::new(rows, widths)
+        .header(
+            Row::new(vec![
+                Cell::from(""),
+                Cell::from("Location").style(Style::new().fg(Color::Red)),
+                Cell::from("Opcode").style(Style::new().fg(Color::Red)),
+                Cell::from("Instruction").style(Style::new().fg(Color::Red)),
+            ])
+            .on_dark_gray(),
+        )
+        .block(
+            Block::new()
+                .title_top(Line::from("INSTRUCTIONS").centered())
+                .borders(Borders::ALL),
+        )
+        .row_highlight_style(Style::new().bg(Color::from_u32(0x32502c)))
+        .highlight_symbol(">>")
+}
+
+fn apply_command_output(app: &mut App<'_>, output: CommandOutput) {
+    app.should_quit = output.should_quit;
+    let color = if output.should_quit {
+        Color::Yellow
+    } else if output.message.contains("unknown")
+        || output.message.contains("invalid")
+        || output.message.contains("requires")
+        || output.message.contains("failed")
+    {
+        Color::Red
+    } else {
+        Color::White
+    };
+    app.show_message("COMMAND", output.message, color);
+}
+
+fn push_history(app: &mut App<'_>, cmd: &str) {
+    if cmd.trim().is_empty() {
+        return;
+    }
+    if app.entries.last().is_none_or(|entry| entry != cmd) {
+        app.entries.push(cmd.to_string());
+    }
+    app.entry_idx = app.entries.len();
+}
+
+fn history_prev(app: &mut App<'_>) {
+    if app.entries.is_empty() {
+        return;
+    }
+    app.entry_idx = app.entry_idx.saturating_sub(1);
+    if let Some(entry) = app.entries.get(app.entry_idx) {
+        *app.input.value_mut() = entry.clone();
+    }
+}
+
+fn history_next(app: &mut App<'_>) {
+    if app.entries.is_empty() {
+        return;
+    }
+    if app.entry_idx + 1 >= app.entries.len() {
+        app.entry_idx = app.entries.len();
+        app.input.value_mut().clear();
+        return;
+    }
+    app.entry_idx += 1;
+    if let Some(entry) = app.entries.get(app.entry_idx) {
+        *app.input.value_mut() = entry.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<ParseResult, String> {
+        parse_cli(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn parses_interactive_binary_and_guest_args() {
+        let ParseResult::Run(cli) = parse(&["program", "one", "two"]).unwrap() else {
+            panic!("expected runnable cli");
+        };
+
+        assert_eq!(
+            cli,
+            Cli {
+                path: "program".to_string(),
+                guest_args: vec!["one".to_string(), "two".to_string()],
+                batch: false,
+                commands: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_batch_commands_before_binary_path() {
+        let ParseResult::Run(cli) = parse(&[
+            "--batch",
+            "-ex",
+            "break pc",
+            "--execute",
+            "continue limit 5",
+            "program",
+            "guest",
+        ])
+        .unwrap() else {
+            panic!("expected runnable cli");
+        };
+
+        assert_eq!(cli.path, "program");
+        assert_eq!(cli.guest_args, vec!["guest"]);
+        assert!(cli.batch);
+        assert_eq!(cli.commands, vec!["break pc", "continue limit 5"]);
+    }
+
+    #[test]
+    fn parses_double_dash_before_binary_path() {
+        let ParseResult::Run(cli) = parse(&["--batch", "-ex", "status", "--", "-program"]).unwrap()
+        else {
+            panic!("expected runnable cli");
+        };
+
+        assert_eq!(cli.path, "-program");
+        assert!(cli.guest_args.is_empty());
+        assert!(cli.batch);
+    }
+
+    #[test]
+    fn reports_missing_execute_argument() {
+        assert_eq!(
+            parse(&["-ex"]).unwrap_err(),
+            "-ex requires a debugger command"
+        );
     }
 }

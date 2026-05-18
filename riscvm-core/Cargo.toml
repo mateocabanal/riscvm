@@ -12,3 +12,10 @@ linux-libc-auxv = { git = "https://github.com/mateocabanal/linux-libc-auxv" }
 rand = "0.8.5"
 thiserror = "2"
 tracing = "0.1.40"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "synthetic"
+harness = false

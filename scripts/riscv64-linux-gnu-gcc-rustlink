@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+DOCKER=${DOCKER:-/Applications/Docker.app/Contents/Resources/bin/docker}
+IMAGE=${RISCVM_RISCV64_TOOLCHAIN_IMAGE:-riscvm-riscv64-linux-gnu:trixie}
+TOOL=${RISCVM_RISCV64_LINKER_TOOL:-riscv64-linux-gnu-gcc}
+WORKDIR=$(pwd -P)
+RUST_SYSROOT=$(rustc --print sysroot)
+
+exec "$DOCKER" run --rm -i --network none --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp \
+    -v "$WORKDIR:$WORKDIR" \
+    -v "$RUST_SYSROOT:$RUST_SYSROOT:ro" \
+    -v /private/tmp:/private/tmp \
+    -w "$WORKDIR" \
+    "$IMAGE" "$TOOL" "$@"

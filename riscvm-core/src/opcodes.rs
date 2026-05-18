@@ -1,7 +1,5 @@
 // RV64I Base Integer Instructions
 
-use bit::BitIndex;
-
 pub const fn is_rv64i_add_instruction(ins: u32) -> bool {
     let add_format: u32 = 0b0000_0000_0000_0000_0000_0000_0011_0011;
     let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
@@ -116,7 +114,7 @@ pub const fn is_rv64i_sll_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_slt_instruction(ins: u32) -> bool {
     let slt_format: u32 = 0b0000_0000_0000_0000_0010_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == slt_format
@@ -124,7 +122,7 @@ pub const fn is_rv64i_slt_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_sltu_instruction(ins: u32) -> bool {
     let sltu_format: u32 = 0b0000_0000_0000_0000_0011_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == sltu_format
@@ -132,7 +130,7 @@ pub const fn is_rv64i_sltu_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_xor_instruction(ins: u32) -> bool {
     let xor_format: u32 = 0b0000_0000_0000_0000_0100_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == xor_format
@@ -140,7 +138,7 @@ pub const fn is_rv64i_xor_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_srl_instruction(ins: u32) -> bool {
     let srl_format: u32 = 0b0000_0000_0000_0000_0101_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == srl_format
@@ -148,7 +146,7 @@ pub const fn is_rv64i_srl_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_sra_instruction(ins: u32) -> bool {
     let format: u32 = 0b0100_0000_0000_0000_0101_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == format
@@ -156,7 +154,7 @@ pub const fn is_rv64i_sra_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_or_instruction(ins: u32) -> bool {
     let format: u32 = 0b0000_0000_0000_0000_0110_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == format
@@ -164,7 +162,7 @@ pub const fn is_rv64i_or_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64i_and_instruction(ins: u32) -> bool {
     let format: u32 = 0b0000_0000_0000_0000_0111_0000_0011_0011;
-    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0011_0011;
+    let mask: u32 = 0b1111_1110_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
     extracted == format
@@ -195,7 +193,7 @@ pub const fn is_rv64i_fence_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_fencei_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0001_0000_0011_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0001_0000_0000_1111;
     let mask: u32 = 0b1111_1111_1111_1111_1111_1111_1111_1111;
 
     let extracted = ins & mask;
@@ -203,7 +201,7 @@ pub const fn is_rv64i_fencei_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrw_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0001_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0001_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -211,7 +209,7 @@ pub const fn is_rv64i_csrrw_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrs_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0010_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0010_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -219,7 +217,7 @@ pub const fn is_rv64i_csrrs_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrc_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0011_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0011_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -227,7 +225,7 @@ pub const fn is_rv64i_csrrc_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrwi_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0101_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0101_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -235,7 +233,7 @@ pub const fn is_rv64i_csrrwi_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrsi_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0110_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0110_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -243,7 +241,7 @@ pub const fn is_rv64i_csrrsi_instruction(ins: u32) -> bool {
 }
 
 pub const fn is_rv64i_csrrci_instruction(ins: u32) -> bool {
-    let format: u32 = 0b0000_0000_0010_0000_0111_0000_0111_0011;
+    let format: u32 = 0b0000_0000_0000_0000_0111_0000_0111_0011;
     let mask: u32 = 0b0000_0000_0000_0000_0111_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -894,6 +892,22 @@ pub const fn is_rv64f_fcvtwus_instruction(ins: u32) -> bool {
     extracted == format
 }
 
+pub const fn is_rv64f_fcvtls_instruction(ins: u32) -> bool {
+    let format: u32 = 0b1100_0000_0010_0000_0000_0000_0101_0011;
+    let mask: u32 = 0b1111_1111_1111_0000_0000_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64f_fcvtlus_instruction(ins: u32) -> bool {
+    let format: u32 = 0b1100_0000_0011_0000_0000_0000_0101_0011;
+    let mask: u32 = 0b1111_1111_1111_0000_0000_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
 pub const fn is_rv64f_fmvxw_instruction(ins: u32) -> bool {
     let format: u32 = 0b1110_0000_0000_0000_0000_0000_0101_0011;
     let mask: u32 = 0b1111_1111_1111_0000_0111_0000_0111_1111;
@@ -944,6 +958,22 @@ pub const fn is_rv64f_fcvtsw_instruction(ins: u32) -> bool {
 
 pub const fn is_rv64f_fcvtswu_instruction(ins: u32) -> bool {
     let format: u32 = 0b1101_0000_0001_0000_0000_0000_0101_0011;
+    let mask: u32 = 0b1111_1111_1111_0000_0000_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64f_fcvtsl_instruction(ins: u32) -> bool {
+    let format: u32 = 0b1101_0000_0010_0000_0000_0000_0101_0011;
+    let mask: u32 = 0b1111_1111_1111_0000_0000_0000_0111_1111;
+
+    let extracted = ins & mask;
+    extracted == format
+}
+
+pub const fn is_rv64f_fcvtslu_instruction(ins: u32) -> bool {
+    let format: u32 = 0b1101_0000_0011_0000_0000_0000_0101_0011;
     let mask: u32 = 0b1111_1111_1111_0000_0000_0000_0111_1111;
 
     let extracted = ins & mask;
@@ -1584,6 +1614,8 @@ pub mod tests {
         map.push(("fmaxs", 0x285312d3));
         map.push(("fcvtws", 0xc00372d3));
         map.push(("fcvtwus", 0xc01372d3));
+        map.push(("fcvtls", 0xc02372d3));
+        map.push(("fcvtlus", 0xc03372d3));
         map.push(("fmvwx", 0xf00082d3));
         map.push(("feqs", 0xa07322d3));
         map.push(("flts", 0xa07312d3));
@@ -1591,6 +1623,8 @@ pub mod tests {
         map.push(("fclasss", 0xe00312d3));
         map.push(("fcvtsw", 0xd002f1d3));
         map.push(("fcvtswu", 0xd012f1d3));
+        map.push(("fcvtsl", 0xd022f1d3));
+        map.push(("fcvtslu", 0xd032f1d3));
         map.push(("fmvxw", 0xe00280d3));
 
         // NOTE: RV64D
@@ -2445,6 +2479,26 @@ pub mod tests {
                 }
             }
             {
+                let value = is_rv64f_fcvtls_instruction(ins);
+                let ins_name = "fcvtls";
+
+                if (value && name != ins_name) || (!value && name == ins_name) {
+                    return Err(
+                        format!("{name}: {ins:#08x}, is not an {ins_name} instruction!").into(),
+                    );
+                }
+            }
+            {
+                let value = is_rv64f_fcvtlus_instruction(ins);
+                let ins_name = "fcvtlus";
+
+                if (value && name != ins_name) || (!value && name == ins_name) {
+                    return Err(
+                        format!("{name}: {ins:#08x}, is not an {ins_name} instruction!").into(),
+                    );
+                }
+            }
+            {
                 let value = is_rv64f_fmvxw_instruction(ins);
                 let ins_name = "fmvxw";
 
@@ -2507,6 +2561,26 @@ pub mod tests {
             {
                 let value = is_rv64f_fcvtswu_instruction(ins);
                 let ins_name = "fcvtswu";
+
+                if (value && name != ins_name) || (!value && name == ins_name) {
+                    return Err(
+                        format!("{name}: {ins:#08x}, is not an {ins_name} instruction!").into(),
+                    );
+                }
+            }
+            {
+                let value = is_rv64f_fcvtsl_instruction(ins);
+                let ins_name = "fcvtsl";
+
+                if (value && name != ins_name) || (!value && name == ins_name) {
+                    return Err(
+                        format!("{name}: {ins:#08x}, is not an {ins_name} instruction!").into(),
+                    );
+                }
+            }
+            {
+                let value = is_rv64f_fcvtslu_instruction(ins);
+                let ins_name = "fcvtslu";
 
                 if (value && name != ins_name) || (!value && name == ins_name) {
                     return Err(

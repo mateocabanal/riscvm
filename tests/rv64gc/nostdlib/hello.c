@@ -8,6 +8,7 @@ void print_str(char *str) {
     len++;
 
   asm("addi a7, zero, 64\n"
+      "addi a0, zero, 1\n"
       "add a1, zero, %[ptr]\n"
       "add a2, zero, %[len]\n"
       "ecall" ::[ptr] "r"(str),
@@ -15,7 +16,7 @@ void print_str(char *str) {
 }
 
 void _start() {
-  printf("Hello World\n");
+  print_str("Hello World\n");
 
   asm("li a7, 93\n"
       "li a0, 0\n"

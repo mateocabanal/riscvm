@@ -12,6 +12,7 @@ const CSR_SATP: u64 = 0x180;
 pub struct Csr {
     satp: u64,
     sstatus: u64,
+    sie: u64,
     stvec: u64,
     sepc: u64,
     scause: u64,
@@ -24,6 +25,7 @@ impl Csr {
         Csr {
             satp: 0,
             sstatus: 0,
+            sie: 0,
             stvec: 0,
             sepc: 0,
             scause: 0,
@@ -35,6 +37,7 @@ impl Csr {
     pub fn read(&self, addr: u64) -> u64 {
         match addr {
             CSR_SSTATUS => self.sstatus,
+            CSR_SIE => self.sie,
             CSR_STVEC => self.stvec,
             CSR_SSCRATCH => self.sscratch,
             CSR_SEPC => self.sepc,
@@ -42,21 +45,22 @@ impl Csr {
             CSR_STVAL => self.stval,
             CSR_SATP => self.satp,
 
-            _ => todo!(),
+            _ => 0,
         }
     }
 
     pub fn write(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
         match addr {
             CSR_SSTATUS => {
-                todo!();
-                // Handle writeable bits; preserve read-only bits
-                // let mask = /* mask of writeable bits */
-                // self.sstatus = (self.sstatus & !mask) | (value & mask);
-                // Ok(())
+                self.sstatus = value;
+                Ok(())
             }
             CSR_STVEC => {
                 self.stvec = value;
+                Ok(())
+            }
+            CSR_SIE => {
+                self.sie = value;
                 Ok(())
             }
             CSR_SSCRATCH => {
