@@ -318,6 +318,21 @@ pub(crate) unsafe extern "C" fn jit_runtime_direct_write_ptr(
     }
 }
 
+pub(crate) unsafe extern "C" fn jit_runtime_try_direct_read_ptr(
+    cpu: *mut RV64GC,
+    addr: u64,
+    len: u64,
+) -> u64 {
+    let Some(cpu) = runtime_cpu(cpu, "try_direct_read_ptr") else {
+        return 0;
+    };
+
+    cpu.ram
+        .direct_read_ptr_range(addr, len)
+        .map(|ptr| ptr as usize as u64)
+        .unwrap_or(0)
+}
+
 pub(crate) unsafe extern "C" fn jit_runtime_float_load(
     cpu: *mut RV64GC,
     rd: u64,

@@ -33,6 +33,7 @@ pub(crate) use runtime::{
     jit_runtime_load_i16, jit_runtime_load_i32, jit_runtime_load_i8, jit_runtime_load_u16,
     jit_runtime_load_u32, jit_runtime_load_u64, jit_runtime_load_u8, jit_runtime_store_u16,
     jit_runtime_store_u32, jit_runtime_store_u64, jit_runtime_store_u8, jit_runtime_trap,
+    jit_runtime_try_direct_read_ptr,
 };
 pub(crate) use runtime::{
     MemoryWidth, RuntimeAtomicOp, RuntimeBinaryOp, RuntimeCsrOp, RuntimeFloatOp, RuntimeTrapOp,
@@ -611,10 +612,10 @@ impl JitEngine {
                 continue;
             }
 
-            let planned = if aot_mode {
-                BlockPlan::optimized_from_cpu(cpu, pc)
+            let (planned, tier) = if aot_mode {
+                aot_precompile_plan_for_tier(cpu, pc, self.options)
             } else {
-                BlockPlan::from_cpu(cpu, pc)
+                (BlockPlan::from_cpu(cpu, pc), JitTier::Baseline)
             };
             let Some(plan) = planned.plan else {
                 if aot_mode && pc == entry_pc {
@@ -637,11 +638,6 @@ impl JitEngine {
                 plan.successors()
             } else {
                 Vec::new()
-            };
-            let tier = if aot_mode {
-                JitTier::Optimized
-            } else {
-                JitTier::Baseline
             };
             self.compile_plan(cpu, pc, plan, tier, "aot", 0)?;
             compiled_blocks += 1;
@@ -916,18 +912,22 @@ impl JitEngine {
             return Err(JitError::InterpreterFallbackDisabled { pc });
         }
 
-        if aot_runtime_plan_should_optimize(&plan) {
+        if plan.contains_compiler_region() {
             return self.compile_plan(cpu, pc, plan, JitTier::Optimized, reason, 0);
         }
 
-        if self.options.trace_compilation {
-            let traced = BlockPlan::trace_from_cpu(cpu, pc);
-            if let Some(trace_plan) = traced.plan {
-                if !trace_plan.can_run_without_interpreter_fallback() {
-                    return Err(JitError::InterpreterFallbackDisabled { pc });
-                }
-                return self.compile_plan(cpu, pc, trace_plan, JitTier::Trace, reason, 0);
+        if let Some(traced) = aot_trace_plan_from_cpu(cpu, pc, self.options) {
+            let Some(trace_plan) = traced.plan else {
+                unreachable!("aot trace helper only returns planned traces")
+            };
+            if !trace_plan.can_run_without_interpreter_fallback() {
+                return Err(JitError::InterpreterFallbackDisabled { pc });
             }
+            return self.compile_plan(cpu, pc, trace_plan, JitTier::Trace, reason, 0);
+        }
+
+        if aot_runtime_plan_should_optimize(&plan) {
+            return self.compile_plan(cpu, pc, plan, JitTier::Optimized, reason, 0);
         }
 
         self.compile_plan(cpu, pc, plan, JitTier::Baseline, reason, 0)
@@ -1113,6 +1113,53 @@ fn aot_runtime_plan_should_optimize(plan: &BlockPlan) -> bool {
         || plan.ends_with_loop_back_edge()
 }
 
+fn aot_precompile_plan_for_tier(
+    cpu: &RV64GC,
+    pc: u64,
+    options: JitOptions,
+) -> (BlockPlanResult, JitTier) {
+    let optimized = BlockPlan::optimized_from_cpu(cpu, pc);
+    if optimized
+        .plan
+        .as_ref()
+        .is_some_and(BlockPlan::contains_compiler_region)
+    {
+        return (optimized, JitTier::Optimized);
+    }
+
+    if let Some(traced) = aot_trace_plan_from_cpu(cpu, pc, options) {
+        return (traced, JitTier::Trace);
+    }
+
+    (optimized, JitTier::Optimized)
+}
+
+fn aot_trace_plan_from_cpu(cpu: &RV64GC, pc: u64, options: JitOptions) -> Option<BlockPlanResult> {
+    if !options.trace_compilation || !options.aot_compile_misses {
+        return None;
+    }
+
+    let traced = BlockPlan::trace_from_cpu(cpu, pc);
+    if traced
+        .plan
+        .as_ref()
+        .is_some_and(aot_trace_plan_should_optimize)
+    {
+        Some(traced)
+    } else {
+        None
+    }
+}
+
+fn aot_trace_plan_should_optimize(plan: &BlockPlan) -> bool {
+    plan.operations.last().is_some_and(|operation| {
+        matches!(
+            operation.kind(),
+            BlockOperationKind::Native(NativeInstruction::TraceLoopGuard { .. })
+        )
+    })
+}
+
 fn plan_for_tier(cpu: &RV64GC, pc: u64, tier: JitTier) -> (BlockPlanResult, JitTier) {
     match tier {
         JitTier::Baseline => {
@@ -1180,7 +1227,12 @@ fn host_libc_function_for_defined_symbol(name: &str) -> Option<HostLibcFunction>
 
 fn host_libc_start_main_shortcut_for_defined_symbol(name: &str) -> Option<HostLibcFunction> {
     match host_libc_function_for_name(name) {
-        Some(HostLibcFunction::LibcStartMain) => Some(HostLibcFunction::LibcStartMain),
+        Some(
+            HostLibcFunction::Exit
+            | HostLibcFunction::LibcStartMain
+            | HostLibcFunction::Printf
+            | HostLibcFunction::Puts,
+        ) => host_libc_function_for_name(name),
         _ => None,
     }
 }
@@ -1847,6 +1899,7 @@ impl BlockPlan {
         Self::counted_diamond_loop_from_cpu(cpu, start_pc)
             .or_else(|| Self::arithmetic_xor_toggle_loop_from_cpu(cpu, start_pc))
             .or_else(|| Self::fibonacci_recurrence_loop_from_cpu(cpu, start_pc))
+            .or_else(|| Self::division_recurrence_loop_from_cpu(cpu, start_pc))
             .or_else(|| Self::store_load_forward_loop_from_cpu(cpu, start_pc))
             .map(|plan| BlockPlanResult {
                 plan: Some(plan),
@@ -2277,6 +2330,213 @@ impl BlockPlan {
         })
     }
 
+    fn division_recurrence_loop_from_cpu(cpu: &RV64GC, start_pc: u64) -> Option<Self> {
+        const GUEST_INSTRUCTIONS: u64 = 22;
+
+        let (
+            signed_div_op,
+            signed_div_xor,
+            temp_register,
+            signed_value,
+            signed_divisor,
+            checksum,
+            pc,
+        ) = parse_division_xor_step(cpu, start_pc, RuntimeBinaryOp::Div, None, None, None, None)?;
+        let (signed_rem_op, signed_rem_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Rem,
+            Some(temp_register),
+            Some(signed_value),
+            Some(signed_divisor),
+            Some(checksum),
+        )?;
+        let (unsigned_div_op, unsigned_div_xor, _, unsigned_value, unsigned_divisor, _, pc) =
+            parse_division_xor_step(
+                cpu,
+                pc,
+                RuntimeBinaryOp::Divu,
+                Some(temp_register),
+                None,
+                None,
+                Some(checksum),
+            )?;
+        let (unsigned_rem_op, unsigned_rem_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Remu,
+            Some(temp_register),
+            Some(unsigned_value),
+            Some(unsigned_divisor),
+            Some(checksum),
+        )?;
+        let (signed_divw_op, signed_divw_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Divw,
+            Some(temp_register),
+            Some(signed_value),
+            Some(signed_divisor),
+            Some(checksum),
+        )?;
+        let (signed_remw_op, signed_remw_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Remw,
+            Some(temp_register),
+            Some(signed_value),
+            Some(signed_divisor),
+            Some(checksum),
+        )?;
+        let (unsigned_divuw_op, unsigned_divuw_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Divuw,
+            Some(temp_register),
+            Some(unsigned_value),
+            Some(unsigned_divisor),
+            Some(checksum),
+        )?;
+        let (unsigned_remuw_op, unsigned_remuw_xor, _, _, _, _, pc) = parse_division_xor_step(
+            cpu,
+            pc,
+            RuntimeBinaryOp::Remuw,
+            Some(temp_register),
+            Some(unsigned_value),
+            Some(unsigned_divisor),
+            Some(checksum),
+        )?;
+
+        let mulhsu_op = lower_native_at(cpu, pc)?;
+        let NativeInstruction::RuntimeBinary {
+            rd,
+            rs1,
+            rs2,
+            op: RuntimeBinaryOp::Mulhsu,
+        } = mulhsu_op.instruction
+        else {
+            return None;
+        };
+        if rd != temp_register || rs1 != signed_value || rs2 != unsigned_divisor {
+            return None;
+        }
+        let mulhsu_xor = lower_native_at(cpu, mulhsu_op.next_pc)?;
+        parse_xor_consumer(mulhsu_xor.instruction, temp_register, Some(checksum))?;
+
+        let signed_increment = lower_native_at(cpu, mulhsu_xor.next_pc)?;
+        let signed_delta = parse_self_addi(signed_increment.instruction, signed_value)?;
+        let unsigned_increment = lower_native_at(cpu, signed_increment.next_pc)?;
+        let unsigned_delta = parse_self_addi(unsigned_increment.instruction, unsigned_value)?;
+        if signed_delta == 0 || unsigned_delta == 0 {
+            return None;
+        }
+
+        let counter_op = lower_native_at(cpu, unsigned_increment.next_pc)?;
+        let NativeInstruction::Addi {
+            rd: counter,
+            rs1: counter_source,
+            imm: -1,
+        } = counter_op.instruction
+        else {
+            return None;
+        };
+        if counter == 0 || counter_source != counter {
+            return None;
+        }
+
+        let branch_op = lower_native_at(cpu, counter_op.next_pc)?;
+        let NativeInstruction::Bne {
+            rs1,
+            rs2,
+            target,
+            fallthrough,
+        } = branch_op.instruction
+        else {
+            return None;
+        };
+        if target != start_pc || !is_zero_compare(counter, rs1, rs2) {
+            return None;
+        }
+
+        if !distinct_nonzero_registers(&[
+            counter,
+            temp_register,
+            signed_value,
+            signed_divisor,
+            unsigned_value,
+            unsigned_divisor,
+            checksum,
+        ]) {
+            return None;
+        }
+
+        let region = DivisionRecurrenceLoop {
+            counter,
+            temp_register,
+            signed_value,
+            signed_divisor,
+            signed_divisor_value: cpu.registers[usize::from(signed_divisor)],
+            unsigned_value,
+            unsigned_divisor,
+            unsigned_divisor_value: cpu.registers[usize::from(unsigned_divisor)],
+            checksum,
+            signed_delta,
+            unsigned_delta,
+            exit_pc: fallthrough,
+            guest_instructions: GUEST_INSTRUCTIONS,
+        };
+        let lowered = [
+            &signed_div_op,
+            &signed_div_xor,
+            &signed_rem_op,
+            &signed_rem_xor,
+            &unsigned_div_op,
+            &unsigned_div_xor,
+            &unsigned_rem_op,
+            &unsigned_rem_xor,
+            &signed_divw_op,
+            &signed_divw_xor,
+            &signed_remw_op,
+            &signed_remw_xor,
+            &unsigned_divuw_op,
+            &unsigned_divuw_xor,
+            &unsigned_remuw_op,
+            &unsigned_remuw_xor,
+            &mulhsu_op,
+            &mulhsu_xor,
+            &signed_increment,
+            &unsigned_increment,
+            &counter_op,
+            &branch_op,
+        ];
+        let mut fingerprint = Vec::with_capacity(lowered.len());
+        for instruction in lowered {
+            push_region_fingerprint(&mut fingerprint, instruction);
+        }
+
+        let operation = BlockOperation {
+            pc: start_pc,
+            opcode: signed_div_op.opcode,
+            kind: BlockOperationKind::Native(NativeInstruction::DivisionRecurrenceLoop(region)),
+        };
+        let profile_instructions = vec![InstructionTrace {
+            pc: start_pc,
+            opcode: signed_div_op.opcode,
+            text: operation.to_string(),
+        }];
+
+        Some(Self {
+            start_pc,
+            end_pc: fallthrough,
+            operations: vec![operation],
+            fingerprint,
+            code_version: cpu.ram.code_version(),
+            stop: BlockStop::ControlFlow { pc: branch_op.pc },
+            guest_instruction_count: region.guest_instructions as usize,
+            profile_instructions,
+        })
+    }
+
     fn store_load_forward_loop_from_cpu(cpu: &RV64GC, start_pc: u64) -> Option<Self> {
         let mask_op = lower_native_at(cpu, start_pc)?;
         let NativeInstruction::Andi {
@@ -2514,7 +2774,7 @@ impl BlockPlan {
     }
 
     fn can_use_register_allocated_optimized_block(&self) -> bool {
-        const MAX_REGALLOC_GUEST_REGISTERS: usize = 8;
+        const MAX_REGALLOC_GUEST_REGISTERS: usize = 16;
 
         let mut guest_registers = Vec::new();
         for operation in &self.operations {
@@ -2537,6 +2797,7 @@ impl BlockPlan {
                 BlockOperationKind::Native(
                     NativeInstruction::ArithmeticXorToggleLoop(_)
                         | NativeInstruction::CountedDiamondLoop(_)
+                        | NativeInstruction::DivisionRecurrenceLoop(_)
                         | NativeInstruction::FibonacciRecurrenceLoop(_)
                         | NativeInstruction::StoreLoadForwardLoop(_)
                 )
@@ -2598,6 +2859,9 @@ impl BlockPlan {
                 push_unique_successor(&mut successors, region.exit_pc);
             }
             NativeInstruction::CountedDiamondLoop(region) => {
+                push_unique_successor(&mut successors, region.exit_pc);
+            }
+            NativeInstruction::DivisionRecurrenceLoop(region) => {
                 push_unique_successor(&mut successors, region.exit_pc);
             }
             NativeInstruction::FibonacciRecurrenceLoop(region) => {
@@ -2764,6 +3028,7 @@ fn collect_regalloc_candidate_registers(
         NativeInstruction::Ecall { .. }
         | NativeInstruction::ArithmeticXorToggleLoop(_)
         | NativeInstruction::CountedDiamondLoop(_)
+        | NativeInstruction::DivisionRecurrenceLoop(_)
         | NativeInstruction::FibonacciRecurrenceLoop(_)
         | NativeInstruction::StoreLoadForwardLoop(_)
         | NativeInstruction::FloatLoad { .. }
@@ -2834,6 +3099,9 @@ fn seed_native_successors(instruction: &NativeInstruction, worklist: &mut VecDeq
             worklist.push_back(region.exit_pc);
         }
         NativeInstruction::CountedDiamondLoop(region) => {
+            worklist.push_back(region.exit_pc);
+        }
+        NativeInstruction::DivisionRecurrenceLoop(region) => {
             worklist.push_back(region.exit_pc);
         }
         NativeInstruction::FibonacciRecurrenceLoop(region) => {
@@ -2996,6 +3264,58 @@ fn parse_diamond_accumulator_arm(cpu: &RV64GC, pc: u64) -> Option<DiamondAccumul
     })
 }
 
+fn parse_division_xor_step(
+    cpu: &RV64GC,
+    pc: u64,
+    expected_op: RuntimeBinaryOp,
+    expected_temp: Option<u8>,
+    expected_lhs: Option<u8>,
+    expected_rhs: Option<u8>,
+    expected_checksum: Option<u8>,
+) -> Option<(LoweredNative, LoweredNative, u8, u8, u8, u8, u64)> {
+    let division = lower_native_at(cpu, pc)?;
+    let NativeInstruction::RuntimeBinary { rd, rs1, rs2, op } = division.instruction else {
+        return None;
+    };
+    if op != expected_op
+        || expected_temp.is_some_and(|temp| rd != temp)
+        || expected_lhs.is_some_and(|lhs| rs1 != lhs)
+        || expected_rhs.is_some_and(|rhs| rs2 != rhs)
+    {
+        return None;
+    }
+
+    let xor = lower_native_at(cpu, division.next_pc)?;
+    let checksum = parse_xor_consumer(xor.instruction, rd, expected_checksum)?;
+    let next_pc = xor.next_pc;
+    Some((division, xor, rd, rs1, rs2, checksum, next_pc))
+}
+
+fn parse_xor_consumer(
+    instruction: NativeInstruction,
+    value_register: u8,
+    expected_checksum: Option<u8>,
+) -> Option<u8> {
+    let NativeInstruction::Xor { rd, rs1, rs2 } = instruction else {
+        return None;
+    };
+    if rd == 0 || expected_checksum.is_some_and(|checksum| rd != checksum) {
+        return None;
+    }
+    if (rs1 == rd && rs2 == value_register) || (rs2 == rd && rs1 == value_register) {
+        Some(rd)
+    } else {
+        None
+    }
+}
+
+fn parse_self_addi(instruction: NativeInstruction, register: u8) -> Option<i64> {
+    let NativeInstruction::Addi { rd, rs1, imm } = instruction else {
+        return None;
+    };
+    (rd == register && rs1 == register).then_some(imm)
+}
+
 fn is_zero_compare(register: u8, lhs: u8, rhs: u8) -> bool {
     (lhs == register && rhs == Zero as u8) || (rhs == register && lhs == Zero as u8)
 }
@@ -3137,6 +3457,23 @@ pub(crate) struct StoreLoadForwardLoop {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DivisionRecurrenceLoop {
+    pub counter: u8,
+    pub temp_register: u8,
+    pub signed_value: u8,
+    pub signed_divisor: u8,
+    pub signed_divisor_value: u64,
+    pub unsigned_value: u8,
+    pub unsigned_divisor: u8,
+    pub unsigned_divisor_value: u64,
+    pub checksum: u8,
+    pub signed_delta: i64,
+    pub unsigned_delta: i64,
+    pub exit_pc: u64,
+    pub guest_instructions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FibonacciRecurrenceLoop {
     pub counter: u8,
     pub current_register: u8,
@@ -3253,6 +3590,7 @@ pub(crate) enum NativeInstruction {
     },
     ArithmeticXorToggleLoop(ArithmeticXorToggleLoop),
     CountedDiamondLoop(CountedDiamondLoop),
+    DivisionRecurrenceLoop(DivisionRecurrenceLoop),
     Ecall {
         next_pc: u64,
     },
@@ -4572,6 +4910,7 @@ impl NativeInstruction {
                 | Self::Bne { .. }
                 | Self::ArithmeticXorToggleLoop(_)
                 | Self::CountedDiamondLoop(_)
+                | Self::DivisionRecurrenceLoop(_)
                 | Self::FibonacciRecurrenceLoop(_)
                 | Self::StoreLoadForwardLoop(_)
                 | Self::Ecall { .. }
@@ -4665,6 +5004,20 @@ impl fmt::Display for NativeInstruction {
                 region.mask,
                 region.zero_accumulator_delta,
                 region.nonzero_accumulator_delta,
+                region.exit_pc
+            ),
+            Self::DivisionRecurrenceLoop(region) => write!(
+                f,
+                "division-recurrence-loop counter=x{} temp=x{} signed=x{}/x{}=0x{:016x} unsigned=x{}/x{}=0x{:016x} checksum=x{} exit=0x{:016x}",
+                region.counter,
+                region.temp_register,
+                region.signed_value,
+                region.signed_divisor,
+                region.signed_divisor_value,
+                region.unsigned_value,
+                region.unsigned_divisor,
+                region.unsigned_divisor_value,
+                region.checksum,
                 region.exit_pc
             ),
             Self::Ecall { .. } => write!(f, "ecall"),
@@ -4883,6 +5236,164 @@ mod tests {
             | opcode
     }
 
+    fn division_recurrence_loop_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 7, 10, 11))); // div x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 7, 10, 11))); // rem x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 5, 1, 7, 12, 13))); // divu x7, x12, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 7, 1, 7, 12, 13))); // remu x7, x12, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x3b, 4, 1, 7, 10, 11))); // divw x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x3b, 6, 1, 7, 10, 11))); // remw x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x3b, 5, 1, 7, 12, 13))); // divuw x7, x12, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x3b, 7, 1, 7, 12, 13))); // remuw x7, x12, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 2, 1, 7, 10, 13))); // mulhsu x7, x10, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 10, 10, 3))); // addi x10, x10, 3
+        bin.extend(rv64_word(rv64_i(0x13, 0, 12, 12, 5))); // addi x12, x12, 5
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1fac))); // bne x5, x0, loop
+        bin
+    }
+
+    fn division_recurrence_cpu(
+        bin: &[u8],
+        count: u64,
+        signed: u64,
+        signed_divisor: u64,
+        unsigned_divisor: u64,
+    ) -> RV64GC {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin.to_vec());
+        cpu.registers[5usize] = count;
+        cpu.registers[10usize] = signed;
+        cpu.registers[11usize] = signed_divisor;
+        cpu.registers[12usize] = 0xabcd_ef01_2345_6789;
+        cpu.registers[13usize] = unsigned_divisor;
+        cpu.registers[20usize] = 0;
+        cpu
+    }
+
+    fn assert_division_recurrence_registers(
+        cpu: &RV64GC,
+        count: u64,
+        signed: u64,
+        signed_divisor: u64,
+        unsigned_divisor: u64,
+    ) {
+        let (counter, temp, signed_value, unsigned_value, checksum) = division_recurrence_reference(
+            count,
+            signed,
+            signed_divisor,
+            0xabcd_ef01_2345_6789,
+            unsigned_divisor,
+        );
+        assert_eq!(cpu.registers[5usize], counter);
+        assert_eq!(cpu.registers[7usize], temp);
+        assert_eq!(cpu.registers[10usize], signed_value);
+        assert_eq!(cpu.registers[12usize], unsigned_value);
+        assert_eq!(cpu.registers[20usize], checksum);
+        assert_eq!(cpu.registers[Pc], 88);
+    }
+
+    fn division_recurrence_reference(
+        mut count: u64,
+        mut signed: u64,
+        signed_divisor: u64,
+        mut unsigned: u64,
+        unsigned_divisor: u64,
+    ) -> (u64, u64, u64, u64, u64) {
+        let mut checksum = 0u64;
+        let mut temp = 0u64;
+        while count != 0 {
+            let div = riscv_div(signed, signed_divisor);
+            let rem = riscv_rem(signed, signed_divisor);
+            let divu = riscv_divu(unsigned, unsigned_divisor);
+            let remu = riscv_remu(unsigned, unsigned_divisor);
+            let divw = riscv_divw(signed, signed_divisor);
+            let remw = riscv_remw(signed, signed_divisor);
+            let divuw = riscv_divuw(unsigned, unsigned_divisor);
+            let remuw = riscv_remuw(unsigned, unsigned_divisor);
+            temp = riscv_mulhsu(signed, unsigned_divisor);
+            checksum ^= div ^ rem ^ divu ^ remu ^ divw ^ remw ^ divuw ^ remuw ^ temp;
+            signed = signed.wrapping_add(3);
+            unsigned = unsigned.wrapping_add(5);
+            count = count.wrapping_sub(1);
+        }
+        (count, temp, signed, unsigned, checksum)
+    }
+
+    fn riscv_div(lhs: u64, rhs: u64) -> u64 {
+        if rhs == 0 {
+            u64::MAX
+        } else {
+            (lhs as i64).wrapping_div(rhs as i64) as u64
+        }
+    }
+
+    fn riscv_rem(lhs: u64, rhs: u64) -> u64 {
+        if rhs == 0 {
+            lhs
+        } else {
+            (lhs as i64).wrapping_rem(rhs as i64) as u64
+        }
+    }
+
+    fn riscv_divu(lhs: u64, rhs: u64) -> u64 {
+        if rhs == 0 {
+            u64::MAX
+        } else {
+            lhs / rhs
+        }
+    }
+
+    fn riscv_remu(lhs: u64, rhs: u64) -> u64 {
+        if rhs == 0 {
+            lhs
+        } else {
+            lhs % rhs
+        }
+    }
+
+    fn riscv_divw(lhs: u64, rhs: u64) -> u64 {
+        let lhs = lhs as u32 as i32;
+        let rhs = rhs as u32 as i32;
+        let quotient = if rhs == 0 { -1 } else { lhs.wrapping_div(rhs) };
+        sign_extend(u64::from(quotient as u32), 32) as u64
+    }
+
+    fn riscv_remw(lhs: u64, rhs: u64) -> u64 {
+        let lhs = lhs as u32 as i32;
+        let rhs = rhs as u32 as i32;
+        let remainder = if rhs == 0 { lhs } else { lhs.wrapping_rem(rhs) };
+        sign_extend(u64::from(remainder as u32), 32) as u64
+    }
+
+    fn riscv_divuw(lhs: u64, rhs: u64) -> u64 {
+        let lhs = lhs as u32;
+        let rhs = rhs as u32;
+        let quotient = if rhs == 0 { u32::MAX } else { lhs / rhs };
+        sign_extend(u64::from(quotient), 32) as u64
+    }
+
+    fn riscv_remuw(lhs: u64, rhs: u64) -> u64 {
+        let lhs = lhs as u32;
+        let rhs = rhs as u32;
+        let remainder = if rhs == 0 { lhs } else { lhs % rhs };
+        sign_extend(u64::from(remainder), 32) as u64
+    }
+
+    fn riscv_mulhsu(lhs: u64, rhs: u64) -> u64 {
+        (((lhs as i64 as i128) * (rhs as u128 as i128)) >> 64) as u64
+    }
+
     fn rv64_r4(opcode: u32, rm: u32, rd: u8, rs1: u8, rs2: u8, rs3: u8) -> u32 {
         rv64_r4_fmt(opcode, 0, rm, rd, rs1, rs2, rs3)
     }
@@ -4922,6 +5433,17 @@ mod tests {
         bin.extend(rv64_word(rv64_beq(7, 0, 16))); // beq x7, x0, +16
         bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 1))); // addi x6, x6, 1
         bin.extend(rv64_word(rv64_i(0x13, 0, 10, 10, 8))); // addi x10, x10, 8
+        bin.extend(rv64_word(rv64_bne(6, 5, 0x1ff0))); // bne x6, x5, -16
+        bin.extend(rv64_word(rv64_i(0x13, 0, 8, 0, 1))); // addi x8, x0, 1
+        bin
+    }
+
+    fn trace_byte_memory_branch_loop_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x03, 4, 7, 10, 0))); // lbu x7, 0(x10)
+        bin.extend(rv64_word(rv64_beq(7, 0, 16))); // beq x7, x0, +16
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 1))); // addi x6, x6, 1
+        bin.extend(rv64_word(rv64_i(0x13, 0, 10, 10, 1))); // addi x10, x10, 1
         bin.extend(rv64_word(rv64_bne(6, 5, 0x1ff0))); // bne x6, x5, -16
         bin.extend(rv64_word(rv64_i(0x13, 0, 8, 0, 1))); // addi x8, x0, 1
         bin
@@ -5016,7 +5538,15 @@ mod tests {
         );
         assert_eq!(
             host_libc_start_main_shortcut_for_defined_symbol("printf"),
-            None
+            Some(HostLibcFunction::Printf)
+        );
+        assert_eq!(
+            host_libc_start_main_shortcut_for_defined_symbol("puts"),
+            Some(HostLibcFunction::Puts)
+        );
+        assert_eq!(
+            host_libc_start_main_shortcut_for_defined_symbol("exit"),
+            Some(HostLibcFunction::Exit)
         );
     }
 
@@ -5186,11 +5716,17 @@ mod tests {
         bin.extend(rv64_word(rv64_r(0x3b, 1, 0, 13, 3, 9))); // sllw x13, x3, x9
         bin.extend(rv64_word(rv64_r(0x3b, 5, 0, 14, 3, 9))); // srlw x14, x3, x9
         bin.extend(rv64_word(rv64_r(0x3b, 5, 0x20, 15, 3, 9))); // sraw x15, x3, x9
+        bin.extend(rv64_word(rv64_i(0x13, 2, 16, 3, 0))); // slti x16, x3, 0
+        bin.extend(rv64_word(rv64_i(0x13, 3, 17, 3, -1))); // sltiu x17, x3, -1
 
         let mut cpu = RV64GC::new();
         cpu.load_bin(bin);
 
-        let mut engine = JitEngine::new().unwrap();
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
 
         engine.step(&mut cpu).unwrap();
         assert_eq!(cpu.registers[3usize], u64::MAX);
@@ -5206,6 +5742,109 @@ mod tests {
         assert_eq!(cpu.registers[13usize], u64::MAX - 1);
         assert_eq!(cpu.registers[14usize], 0x7fff_ffff);
         assert_eq!(cpu.registers[15usize], u64::MAX);
+        assert_eq!(cpu.registers[16usize], 1);
+        assert_eq!(cpu.registers[17usize], 0);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.matches("cset x9").count() >= 4);
+        assert!(listing.contains("cmp x9, #0 ; slti"));
+        assert!(listing.contains("cmn x9, #1 ; sltiu"));
+        assert!(!listing.contains("csel x9"));
+        assert!(!listing.contains("movz x10, #0xffff"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn jit_lowers_shift_immediates_to_single_host_instructions() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x13, 0, 1, 0, -1))); // addi x1, x0, -1
+        bin.extend(rv64_word(rv64_i(0x13, 1, 2, 1, 3))); // slli x2, x1, 3
+        bin.extend(rv64_word(rv64_i(0x13, 5, 3, 1, 4))); // srli x3, x1, 4
+        bin.extend(rv64_word(rv64_i(0x13, 5, 4, 1, 0x404))); // srai x4, x1, 4
+        bin.extend(rv64_word(rv64_i(0x1b, 0, 5, 0, -1))); // addiw x5, x0, -1
+        bin.extend(rv64_word(rv64_i(0x1b, 1, 6, 5, 3))); // slliw x6, x5, 3
+        bin.extend(rv64_word(rv64_i(0x1b, 5, 7, 5, 4))); // srliw x7, x5, 4
+        bin.extend(rv64_word(rv64_i(0x1b, 5, 8, 5, 0x404))); // sraiw x8, x5, 4
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[2usize], u64::MAX << 3);
+        assert_eq!(cpu.registers[3usize], u64::MAX >> 4);
+        assert_eq!(cpu.registers[4usize], u64::MAX);
+        assert_eq!(cpu.registers[6usize], sign_extend(0xffff_fff8, 32) as u64);
+        assert_eq!(cpu.registers[7usize], 0x0fff_ffff);
+        assert_eq!(cpu.registers[8usize], u64::MAX);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("lsl x"));
+        assert!(listing.contains("lsr x"));
+        assert!(listing.contains("asr x"));
+        assert!(listing.contains("lsl w"));
+        assert!(listing.contains("lsr w"));
+        assert!(listing.contains("asr w"));
+        assert!(!listing.contains("lslv"));
+        assert!(!listing.contains("lsrv"));
+        assert!(!listing.contains("asrv"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn jit_lowers_logical_immediates_to_aarch64_bitmasks() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x13, 0, 1, 0, -1))); // addi x1, x0, -1
+        bin.extend(rv64_word(rv64_i(0x13, 7, 2, 1, 0xff))); // andi x2, x1, 0xff
+        bin.extend(rv64_word(rv64_i(0x13, 6, 3, 0, 0x7f))); // ori x3, x0, 0x7f
+        bin.extend(rv64_word(rv64_i(0x13, 4, 4, 0, 0x3f))); // xori x4, x0, 0x3f
+        bin.extend(rv64_word(rv64_i(0x13, 7, 5, 1, -1))); // andi x5, x1, -1
+        bin.extend(rv64_word(rv64_i(0x13, 4, 6, 1, -1))); // xori x6, x1, -1
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[2usize], 0xff);
+        assert_eq!(cpu.registers[3usize], 0x7f);
+        assert_eq!(cpu.registers[4usize], 0x3f);
+        assert_eq!(cpu.registers[5usize], u64::MAX);
+        assert_eq!(cpu.registers[6usize], 0);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("and x9, x9, #0x00000000000000ff"));
+        assert!(listing.contains("orr x9, x31, #0x000000000000007f"));
+        assert!(listing.contains("eor x9, x31, #0x000000000000003f"));
+        assert!(listing.contains("mvn x9, x9"));
+        assert!(!listing.contains("movz x10, #0x00ff"));
+        assert!(!listing.contains("movz x10, #0x007f"));
+        assert!(!listing.contains("movz x10, #0x003f"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -5229,6 +5868,350 @@ mod tests {
         assert_eq!(cpu.registers[4usize], u64::MAX - 20);
         assert_eq!(cpu.registers[5usize], u64::MAX);
         assert_eq!(cpu.registers[6usize], 6);
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn jit_lowers_division_remainder_and_mulhsu_natively() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 3, 1, 2))); // div x3, x1, x2
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 4, 1, 2))); // rem x4, x1, x2
+        bin.extend(rv64_word(rv64_r(0x33, 5, 1, 5, 1, 0))); // divu x5, x1, x0
+        bin.extend(rv64_word(rv64_r(0x33, 7, 1, 6, 1, 0))); // remu x6, x1, x0
+        bin.extend(rv64_word(rv64_r(0x3b, 4, 1, 7, 8, 9))); // divw x7, x8, x9
+        bin.extend(rv64_word(rv64_r(0x3b, 6, 1, 10, 8, 9))); // remw x10, x8, x9
+        bin.extend(rv64_word(rv64_r(0x3b, 5, 1, 11, 8, 0))); // divuw x11, x8, x0
+        bin.extend(rv64_word(rv64_r(0x3b, 7, 1, 12, 8, 0))); // remuw x12, x8, x0
+        bin.extend(rv64_word(rv64_r(0x33, 2, 1, 13, 14, 15))); // mulhsu x13, x14, x15
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 18, 16, 17))); // div x18, x16, x17
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 19, 16, 17))); // rem x19, x16, x17
+        bin.extend(rv64_word(rv64_r(0x3b, 4, 1, 20, 16, 17))); // divw x20, x16, x17
+        bin.extend(rv64_word(rv64_r(0x3b, 6, 1, 21, 16, 17))); // remw x21, x16, x17
+        bin.extend(rv64_word(rv64_r(0x33, 5, 1, 24, 22, 23))); // divu x24, x22, x23
+        bin.extend(rv64_word(rv64_r(0x33, 7, 1, 25, 22, 23))); // remu x25, x22, x23
+        bin.extend(rv64_word(rv64_r(0x3b, 5, 1, 26, 22, 23))); // divuw x26, x22, x23
+        bin.extend(rv64_word(rv64_r(0x3b, 7, 1, 27, 22, 23))); // remuw x27, x22, x23
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[1usize] = i64::MIN as u64;
+        cpu.registers[2usize] = u64::MAX;
+        cpu.registers[8usize] = 0x8000_0000;
+        cpu.registers[9usize] = 0xffff_ffff;
+        cpu.registers[14usize] = (-3i64) as u64;
+        cpu.registers[15usize] = 7;
+        cpu.registers[16usize] = (-37i64) as u64;
+        cpu.registers[17usize] = 5;
+        cpu.registers[22usize] = 100;
+        cpu.registers[23usize] = 9;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[3usize], i64::MIN as u64);
+        assert_eq!(cpu.registers[4usize], 0);
+        assert_eq!(cpu.registers[5usize], u64::MAX);
+        assert_eq!(cpu.registers[6usize], i64::MIN as u64);
+        assert_eq!(cpu.registers[7usize], sign_extend(0x8000_0000, 32) as u64);
+        assert_eq!(cpu.registers[10usize], 0);
+        assert_eq!(cpu.registers[11usize], u64::MAX);
+        assert_eq!(cpu.registers[12usize], sign_extend(0x8000_0000, 32) as u64);
+        assert_eq!(cpu.registers[13usize], u64::MAX);
+        assert_eq!(cpu.registers[18usize], (-7i64) as u64);
+        assert_eq!(cpu.registers[19usize], (-2i64) as u64);
+        assert_eq!(cpu.registers[20usize], (-7i64) as u64);
+        assert_eq!(cpu.registers[21usize], (-2i64) as u64);
+        assert_eq!(cpu.registers[24usize], 11);
+        assert_eq!(cpu.registers[25usize], 1);
+        assert_eq!(cpu.registers[26usize], 11);
+        assert_eq!(cpu.registers[27usize], 1);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("sdiv x"));
+        assert!(listing.contains("udiv x"));
+        assert!(listing.contains("sdiv w"));
+        assert!(listing.contains("udiv w"));
+        assert!(listing.contains("msub x"));
+        assert!(listing.contains("msub w"));
+        assert!(listing.contains("umulh x"));
+        assert!(listing.contains("mulhsu lhs sign mask"));
+        assert!(!listing.contains("csel x11, x12, x11, lt ; mulhsu signed high"));
+        assert!(!listing.contains("jit_runtime_binary"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_fuses_adjacent_div_rem_pairs_in_register_allocated_loops() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 7, 10, 11))); // div x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 8, 10, 11))); // rem x8, x10, x11
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1ff4))); // bne x5, x0, loop
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = (-37i64) as u64;
+        cpu.registers[11usize] = 5;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[7usize], (-7i64) as u64);
+        assert_eq!(cpu.registers[8usize], (-2i64) as u64);
+        assert_eq!(cpu.registers[Pc], 16);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("fused div/rem"));
+        assert_eq!(listing.matches("sdiv x").count(), 2);
+        assert!(!listing.contains("stp x29, x30"));
+        assert!(!listing.contains("stp x19, x20"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(listing.contains("fused quotient"));
+        assert!(listing.contains("invariant divisor x11 zero mask"));
+        assert!(listing.contains("fused quotient nonzero divisor"));
+        assert!(listing.contains("fused quotient div divisor mask"));
+        assert!(listing.contains("fused remainder"));
+        assert!(listing.contains("regalloc final loop decrement"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_fuses_div_rem_pairs_across_pure_integer_consumers() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 7, 10, 11))); // div x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 7, 10, 11))); // rem x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 7, 0, 123))); // addi x7, x0, 123
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1fe8))); // bne x5, x0, loop
+
+        let quotient = (-7i64) as u64;
+        let remainder = (-2i64) as u64;
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = (-37i64) as u64;
+        cpu.registers[11usize] = 5;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[7usize], 123);
+        assert_eq!(cpu.registers[20usize], quotient ^ remainder);
+        assert_eq!(cpu.registers[Pc], 28);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("fused div/rem"));
+        assert_eq!(listing.matches("sdiv x").count(), 2);
+        assert!(!listing.contains("stp x29, x30"));
+        assert!(!listing.contains("stp x19, x20"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(listing.contains("fused quotient"));
+        assert!(listing.contains("invariant divisor x11 zero mask"));
+        assert!(listing.contains("regalloc fused quotient consumer"));
+        assert!(listing.contains("fused quotient div divisor mask"));
+        assert!(listing.contains("regalloc fused remainder consumer"));
+        assert_eq!(listing.matches("regalloc final loop decrement").count(), 2);
+        assert!(!listing.contains("fused deferred remainder"));
+        assert!(!listing.contains("fused quotient nonzero divisor"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_handles_zero_divisor_with_invariant_masks() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 4, 1, 7, 10, 11))); // div x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_r(0x33, 6, 1, 7, 10, 11))); // rem x7, x10, x11
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 7, 0, 123))); // addi x7, x0, 123
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1fe8))); // bne x5, x0, loop
+
+        let quotient = u64::MAX;
+        let remainder = (-37i64) as u64;
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = remainder;
+        cpu.registers[11usize] = 0;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[7usize], 123);
+        assert_eq!(cpu.registers[20usize], quotient ^ remainder);
+        assert_eq!(cpu.registers[Pc], 28);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("invariant divisor x11 zero mask"));
+        assert!(listing.contains("fused quotient div divisor mask"));
+        assert!(listing.contains("jit_masked_divisor_loop"));
+        assert!(!listing.contains("stp x29, x30"));
+        assert!(!listing.contains("stp x19, x20"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(listing.contains("orr x"));
+        assert!(!listing.contains("fused div divisor zero"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_schedules_division_recurrence_loop() {
+        let bin = division_recurrence_loop_bin();
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        let mut cpu = division_recurrence_cpu(&bin, 3, (-123_456_789i64) as u64, 37, 97);
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 66
+            }
+        );
+        assert_division_recurrence_registers(&cpu, 3, (-123_456_789i64) as u64, 37, 97);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("division recurrence reciprocal signed guard"));
+        assert!(listing.contains("division recurrence reciprocal div quotient"));
+        assert!(listing.contains("division recurrence reciprocal divu quotient"));
+        assert!(listing.contains("division recurrence scheduled div"));
+        assert!(listing.contains("division recurrence masked"));
+        assert!(!listing.contains("fused div/rem"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(!listing.contains("stp x29, x30"));
+
+        let mut zero_cpu = division_recurrence_cpu(&bin, 3, (-123_456_789i64) as u64, 0, 97);
+        assert_eq!(
+            engine.step(&mut zero_cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 66
+            }
+        );
+        assert_division_recurrence_registers(&zero_cpu, 3, (-123_456_789i64) as u64, 0, 97);
+
+        let mut changed_cpu = division_recurrence_cpu(&bin, 3, (-123_456_789i64) as u64, 41, 89);
+        assert_eq!(
+            engine.step(&mut changed_cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 66
+            }
+        );
+        assert_division_recurrence_registers(&changed_cpu, 3, (-123_456_789i64) as u64, 41, 89);
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_writes_mulhsu_directly_when_destination_does_not_alias_sources() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 2, 1, 7, 10, 13))); // mulhsu x7, x10, x13
+        bin.extend(rv64_word(rv64_r(0x33, 4, 0, 20, 20, 7))); // xor x20, x20, x7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1ff4))); // bne x5, x0, loop
+
+        let lhs = (-123_456_789i64) as u64;
+        let rhs = 97;
+        let unsigned_high = (((lhs as u128) * (rhs as u128)) >> 64) as u64;
+        let correction = if (lhs as i64) < 0 { rhs } else { 0 };
+        let expected = unsigned_high.wrapping_sub(correction);
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = lhs;
+        cpu.registers[13usize] = rhs;
+        cpu.registers[20usize] = 0;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 12,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[7usize], expected);
+        assert_eq!(cpu.registers[20usize], expected);
+        assert_eq!(cpu.registers[Pc], 16);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("umulh x4, x2, x3 ; mulhsu unsigned high"));
+        assert!(listing.contains("; initial loop counter x5"));
+        assert!(listing.contains("subs x6, x6, #1 ; regalloc final loop decrement"));
+        assert!(listing.contains("lsl x0, x10, #2 ; return executed instructions"));
+        assert!(!listing.contains("cmp x6, x31"));
+        assert!(!listing.contains("mov x4, x11 ; mulhsu result"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(!listing.contains("stp x29, x30"));
+        assert!(!listing.contains("stp x19, x20"));
+        assert!(!listing.contains("stp x21"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -5712,6 +6695,32 @@ mod tests {
         bin
     }
 
+    fn counted_diamond_mask3_loop_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x13, 7, 28, 5, 3))); // andi x28, x5, 3
+        bin.extend(rv64_word(rv64_beq(28, 0, 12))); // beq x28, x0, zero arm
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 3))); // addi x6, x6, 3
+        bin.extend(rv64_word(rv64_jal(0, 8))); // jal x0, tail
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 7))); // addi x6, x6, 7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 7, 7, 1))); // addi x7, x7, 1
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1fe4))); // bne x5, x0, loop
+        bin
+    }
+
+    fn counted_diamond_mask6_loop_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x13, 7, 28, 5, 6))); // andi x28, x5, 6
+        bin.extend(rv64_word(rv64_beq(28, 0, 12))); // beq x28, x0, zero arm
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 3))); // addi x6, x6, 3
+        bin.extend(rv64_word(rv64_jal(0, 8))); // jal x0, tail
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 7))); // addi x6, x6, 7
+        bin.extend(rv64_word(rv64_i(0x13, 0, 7, 7, 1))); // addi x7, x7, 1
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, -1))); // addi x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1fe4))); // bne x5, x0, loop
+        bin
+    }
+
     fn arithmetic_xor_toggle_loop_bin() -> Vec<u8> {
         let mut bin = Vec::new();
         bin.extend(rv64_word(rv64_r(0x33, 0, 0, 7, 7, 6))); // add x7, x7, x6
@@ -6095,7 +7104,7 @@ mod tests {
             .map(|emission| emission.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(listing.contains("counted diamond pair count"));
+        assert!(listing.contains("counted diamond zero-arm count"));
         assert!(listing.contains("counted diamond instruction count"));
         assert!(!listing.contains("b.ne .counted_diamond_loop"));
     }
@@ -6144,6 +7153,87 @@ mod tests {
         assert_eq!(cpu.registers[7usize], 0);
         assert_eq!(cpu.registers[28usize], 1);
         assert_eq!(cpu.registers[Pc], 32);
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_closed_forms_power_of_two_counted_diamond_masks() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(counted_diamond_mask3_loop_bin());
+        cpu.registers[5usize] = 6;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Optimized, "test", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 41,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[6usize], 22);
+        assert_eq!(cpu.registers[7usize], 6);
+        assert_eq!(cpu.registers[28usize], 1);
+        assert_eq!(cpu.registers[Pc], 32);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("counted diamond zero-arm count"));
+        assert!(!listing.contains("b.ne .counted_diamond_loop"));
+        assert!(!listing.contains("stp x19, x20"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_executes_iterative_counted_diamond_loop_region_without_frame() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(counted_diamond_mask6_loop_bin());
+        cpu.registers[5usize] = 6;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Optimized, "test", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 41,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[6usize], 22);
+        assert_eq!(cpu.registers[7usize], 6);
+        assert_eq!(cpu.registers[28usize], 0);
+        assert_eq!(cpu.registers[Pc], 32);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("subs x2, x2, #1 ; counted diamond backedge"));
+        assert!(listing.contains("b.ne .counted_diamond_loop"));
+        assert!(!listing.contains("cmp x2, xzr ; counted diamond backedge"));
+        assert!(!listing.contains("stp x19, x20"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -6236,7 +7326,11 @@ mod tests {
             .join("\n");
         assert!(listing.contains("fib executed instructions"));
         assert!(listing.contains("fib next"));
+        assert!(listing.contains("#256 ; fib unrolled count"));
         assert!(listing.contains("b.hs .fib_unrolled_loop"));
+        assert!(listing.contains("subs x9, x9, #1 ; fib tail backedge"));
+        assert!(!listing.contains("cmp x9, xzr ; fib tail backedge"));
+        assert!(!listing.contains("stp x19, x20"));
         assert!(!listing.contains("jit_runtime_fibonacci_recurrence"));
     }
 
@@ -6539,13 +7633,105 @@ mod tests {
             .map(|emission| emission.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(listing.contains("jit_runtime_load_u64"));
+        assert!(listing.contains("jit_runtime_try_direct_read_ptr"));
+        assert!(listing.contains("direct trace unrolled load"));
         assert!(listing.contains("regalloc trace guard"));
         assert!(listing.contains("regalloc trace loop guard"));
         assert!(!listing.contains("load guest x7"));
         assert!(listing.contains("trace guard"));
         assert!(listing.contains("trace loop guard"));
         assert!(listing.contains("trace_loop_start"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn trace_jit_direct_load_loop_handles_load_guard_side_exit() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(trace_memory_branch_loop_bin());
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, 24, vec![0; 24]))
+            .unwrap();
+        cpu.ram.write_doubleword(0x1000, 1).unwrap();
+        cpu.ram.write_doubleword(0x1008, 0).unwrap();
+        cpu.ram.write_doubleword(0x1010, 1).unwrap();
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = 0x1000;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            trace_compilation: true,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Trace, "test", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 7,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 3);
+        assert_eq!(cpu.registers[6usize], 1);
+        assert_eq!(cpu.registers[7usize], 0);
+        assert_eq!(cpu.registers[10usize], 0x1008);
+        assert_eq!(cpu.registers[Pc], 20);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("cbz .direct_trace_load_side_exit"));
+        assert!(listing.contains("direct_trace_load_side_exit"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn trace_jit_direct_byte_load_loop_handles_load_guard_side_exit() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(trace_byte_memory_branch_loop_bin());
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, 3, vec![1, 0, 1]))
+            .unwrap();
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = 0x1000;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            trace_compilation: true,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Trace, "test", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 7,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 3);
+        assert_eq!(cpu.registers[6usize], 1);
+        assert_eq!(cpu.registers[7usize], 0);
+        assert_eq!(cpu.registers[10usize], 0x1001);
+        assert_eq!(cpu.registers[Pc], 20);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("ldrb w"));
+        assert!(listing.contains("direct_trace_load_side_exit"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -6655,14 +7841,16 @@ mod tests {
     #[test]
     fn jit_recompiles_hot_blocks_to_the_optimized_tier() {
         let mut bin = Vec::new();
-        bin.extend(rv64_word(0x0000_8093)); // addi x1, x1, 0
-        bin.extend(rv64_word(rv64_beq(0, 0, 0x1ffc))); // beq x0, x0, -4
+        bin.extend(rv64_word(rv64_i(0x13, 0, 5, 5, 1))); // addi x5, x5, 1
+        bin.extend(rv64_word(rv64_i(0x13, 0, 6, 6, 1))); // addi x6, x6, 1
+        bin.extend(rv64_word(rv64_beq(0, 0, 8))); // beq x0, x0, +8
 
         let mut cpu = RV64GC::new();
         cpu.load_bin(bin);
 
         let mut engine = JitEngine::with_options(JitOptions {
             dynamic_recompilation: true,
+            trace_compilation: false,
             hot_threshold: 1,
             ..JitOptions::default()
         })
@@ -6671,13 +7859,20 @@ mod tests {
         engine.step(&mut cpu).unwrap();
         let baseline_len = engine.cache.get(&0).unwrap().code_len;
         assert_eq!(engine.cache.get(&0).unwrap().tier, JitTier::Baseline);
+        assert_eq!(cpu.registers[5usize], 1);
+        assert_eq!(cpu.registers[6usize], 1);
+        assert_eq!(cpu.registers[Pc], 16);
 
+        cpu.registers[Pc] = 0;
         engine.step(&mut cpu).unwrap();
         let block = engine.cache.get(&0).unwrap();
         assert_eq!(block.tier, JitTier::Optimized);
         assert_eq!(block.execution_count, 2);
-        assert_eq!(block.instruction_count, 2);
+        assert_eq!(block.instruction_count, 3);
         assert!(block.code_len < baseline_len);
+        assert_eq!(cpu.registers[5usize], 2);
+        assert_eq!(cpu.registers[6usize], 2);
+        assert_eq!(cpu.registers[Pc], 16);
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -6716,6 +7911,40 @@ mod tests {
             .join("\n");
         assert!(listing.contains("load guest x5"));
         assert!(!listing.contains("load guest x28"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_regalloc_handles_wide_basic_blocks() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_r(0x33, 0, 0, 13, 1, 2))); // add x13, x1, x2
+        bin.extend(rv64_word(rv64_r(0x33, 0, 0, 14, 3, 4))); // add x14, x3, x4
+        bin.extend(rv64_word(rv64_r(0x33, 0, 0, 15, 5, 6))); // add x15, x5, x6
+        bin.extend(rv64_word(rv64_r(0x33, 0, 0, 16, 7, 8))); // add x16, x7, x8
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Optimized, "test", 0)
+            .unwrap();
+
+        let block = engine.cache.get(&0).unwrap();
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("; regalloc"));
+        assert!(!listing.contains("x29, x30"));
+        assert!(!listing.contains("load guest x13"));
+        assert!(listing.contains("store guest x16"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -6836,6 +8065,7 @@ mod tests {
         let mut engine = JitEngine::with_options(JitOptions {
             dynamic_recompilation: true,
             hot_threshold: 1,
+            dump_instructions: true,
             ..JitOptions::default()
         })
         .unwrap();
@@ -6861,6 +8091,60 @@ mod tests {
         assert_eq!(block.tier, JitTier::Optimized);
         assert_eq!(cpu.registers[1usize], 0);
         assert_eq!(cpu.registers[Pc], 8);
+
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("mov x10, x2 ; initial loop counter x1"));
+        assert!(listing.contains("subs x2, x2, #1 ; regalloc final loop decrement"));
+        assert!(listing.contains("lsl x0, x10, #1 ; return executed instructions"));
+        assert!(listing.contains("ldr x2, [x1, #8] ; load guest x1"));
+        assert!(!listing.contains("cmp x2, x31"));
+        assert!(!listing.contains("selective loop save"));
+        assert!(!listing.contains("stp x19, x20"));
+        assert!(!listing.contains("stp x21"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn optimized_jit_uses_flag_setting_word_decrement_for_addiw_loop() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_i(0x1b, 0, 5, 5, -1))); // addiw x5, x5, -1
+        bin.extend(rv64_word(rv64_bne(5, 0, 0x1ffc))); // bne x5, x0, -4
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+        cpu.registers[5usize] = 3;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 6
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 0);
+        assert_eq!(cpu.registers[Pc], 8);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("subs w2, w2, #1 ; regalloc final loop decrement"));
+        assert!(listing.contains("sxtw x2, w2"));
+        assert!(!listing.contains("cmp x2, x31"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -7003,6 +8287,46 @@ mod tests {
         );
         assert_eq!(cpu.registers[2usize], 1);
         assert_eq!(engine.cache.get(&8).unwrap().tier, JitTier::Baseline);
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn default_aot_precompiles_trace_loop_entries() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(trace_memory_branch_loop_bin());
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, 24, vec![0; 24]))
+            .unwrap();
+        cpu.ram.write_doubleword(0x1000, 1).unwrap();
+        cpu.ram.write_doubleword(0x1008, 1).unwrap();
+        cpu.ram.write_doubleword(0x1010, 1).unwrap();
+        cpu.registers[5usize] = 3;
+        cpu.registers[10usize] = 0x1000;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            execution_mode: JitExecutionMode::Aot,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 15,
+            }
+        );
+        assert_eq!(cpu.registers[6usize], 3);
+        assert_eq!(cpu.registers[10usize], 0x1018);
+        assert_eq!(cpu.registers[Pc], 20);
+
+        let block = engine.cache.get(&0).unwrap();
+        assert_eq!(block.tier, JitTier::Trace);
+        assert!(block
+            .native_listing
+            .iter()
+            .any(|emission| emission.text.contains("jit_runtime_try_direct_read_ptr")));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]

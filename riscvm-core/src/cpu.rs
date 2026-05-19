@@ -13,7 +13,6 @@ use crate::fcsr::round_f64;
 use crate::fcsr::RoundingMode;
 use crate::fcsr::FCSR;
 use crate::filesystem::{FileSystemError, GuestFileSystem};
-use crate::opcodes::*;
 use crate::ram::MemoryRegion;
 use crate::ram::Ram;
 use crate::sign_extend;
@@ -67,6 +66,597 @@ fn instruction_len(opcode: u32) -> u64 {
 
 fn decode_cache_index(pc: u64) -> usize {
     ((pc >> 1) as usize) & (DECODE_CACHE_SIZE - 1)
+}
+
+#[inline]
+fn decode_instruction(current_ins: u32) -> RV64GCInstruction {
+    if current_ins & 0b11 == 0b11 {
+        decode_standard_instruction(current_ins)
+    } else {
+        decode_compressed_instruction(current_ins as u16)
+    }
+}
+
+#[inline]
+fn decode_standard_instruction(current_ins: u32) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    let rd = current_ins.bit_range(7..12) as Reg;
+    let funct3 = current_ins.bit_range(12..15);
+    let rs1 = current_ins.bit_range(15..20) as Reg;
+    let rs2 = current_ins.bit_range(20..25) as Reg;
+    let rs3 = current_ins.bit_range(27..32) as Reg;
+    let funct7 = current_ins.bit_range(25..32);
+    let imm = current_ins.bit_range(20..32) as Imm;
+    let rm = funct3 as Reg;
+
+    match current_ins & 0x7f {
+        0x03 => match funct3 {
+            0 => Lb(rd, rs1, sign_extend12(imm)),
+            1 => Lh(rd, rs1, sign_extend12(imm)),
+            2 => Lw(rd, rs1, sign_extend12(imm)),
+            3 => Ld(rd, rs1, sign_extend12(imm)),
+            4 => Lbu(rd, rs1, sign_extend12(imm)),
+            5 => Lhu(rd, rs1, sign_extend12(imm)),
+            6 => Lwu(rd, rs1, imm),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x07 => match funct3 {
+            2 => {
+                trace!("flw: {current_ins:08x}");
+                Flw(rd, rs1, imm)
+            }
+            3 => Fld(rd, rs1, imm),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x0f => match current_ins {
+            0x0000_100f => FenceI,
+            i if i & 0xf00f_ffff == 0x0000_000f => {
+                Fence(i.bit_range(20..24) as u8, i.bit_range(24..28) as u8)
+            }
+            _ => IllegalInstruction(current_ins),
+        },
+        0x13 => match funct3 {
+            0 => Addi(rd, rs1, sign_extend12(imm)),
+            1 if current_ins >> 27 == 0 => Slli(rd, rs1, current_ins.bit_range(20..26)),
+            2 => Slti(rd, rs1, sign_extend12(imm)),
+            3 => Sltiu(rd, rs1, imm),
+            4 => Xori(rd, rs1, sign_extend12(imm)),
+            5 if current_ins >> 27 == 0 => Srli(rd, rs1, current_ins.bit_range(20..26)),
+            5 if current_ins >> 26 == 0x10 => Srai(rd, rs1, current_ins.bit_range(20..26)),
+            6 => Ori(rd, rs1, sign_extend12(imm)),
+            7 => Andi(rd, rs1, sign_extend12(imm)),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x17 => {
+            let ov_imm = current_ins.bit_range(12..32) << 12;
+            Auipc(rd, sign_extend(ov_imm.into(), 32))
+        }
+        0x1b => match funct3 {
+            0 => Addiw(rd, rs1, imm),
+            1 if funct7 == 0 => Slliw(rd, rs1, current_ins.bit_range(20..26)),
+            5 => match funct7 {
+                0x00 => Srliw(rd, rs1, current_ins.bit_range(20..26)),
+                0x20 => Sraiw(rd, rs1, current_ins.bit_range(20..25)),
+                _ => IllegalInstruction(current_ins),
+            },
+            _ => IllegalInstruction(current_ins),
+        },
+        0x23 => {
+            let offset = store_offset(current_ins);
+            match funct3 {
+                0 => Sb(rs1, rs2, sign_extend12(offset)),
+                1 => Sh(rs1, rs2, sign_extend12(offset)),
+                2 => Sw(rs1, rs2, sign_extend12(offset)),
+                3 => Sd(rs1, rs2, sign_extend12(offset)),
+                _ => IllegalInstruction(current_ins),
+            }
+        }
+        0x27 => {
+            let offset = store_offset(current_ins);
+            match funct3 {
+                2 => {
+                    trace!("fsw: {current_ins:08x}");
+                    trace!("imm: {}", sign_extend12(offset));
+                    Fsw(rs1, rs2, offset)
+                }
+                3 => Fsd(rs1, rs2, sign_extend12(offset)),
+                _ => IllegalInstruction(current_ins),
+            }
+        }
+        0x2f => decode_atomic_instruction(current_ins, rd, rs1, rs2, funct3),
+        0x33 => decode_op_instruction(current_ins, rd, rs1, rs2, funct3, funct7),
+        0x37 => {
+            let ov_imm = current_ins.bit_range(12..32) << 12;
+            Lui(rd, sign_extend(ov_imm.into(), 32))
+        }
+        0x3b => decode_op32_instruction(current_ins, rd, rs1, rs2, funct3, funct7),
+        0x43 => match current_ins.bit_range(25..27) {
+            0 => Fmadds(rd, rm, rs1, rs2, rs3),
+            1 => Fmaddd(rd, rm, rs1, rs2, rs3),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x47 => match current_ins.bit_range(25..27) {
+            0 => Fmsubs(rd, rm, rs1, rs2, rs3),
+            1 => Fmsubd(rd, rm, rs1, rs2, rs3),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x4b => match current_ins.bit_range(25..27) {
+            0 => Fnmsubs(rd, rm, rs1, rs2, rs3),
+            1 => Fnmsubd(rd, rm, rs1, rs2, rs3),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x4f => match current_ins.bit_range(25..27) {
+            0 => Fnmadds(rd, rm, rs1, rs2, rs3),
+            1 => Fnmaddd(rd, rm, rs1, rs2, rs3),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x53 => decode_float_op_instruction(current_ins, rd, rm, rs1, rs2, funct3, funct7),
+        0x63 => {
+            let offset = branch_offset(current_ins);
+            match funct3 {
+                0 => Beq(rs1, rs2, offset),
+                1 => Bne(rs1, rs2, offset),
+                4 => Blt(rs1, rs2, offset),
+                5 => Bge(rs1, rs2, offset),
+                6 => Bltu(rs1, rs2, offset),
+                7 => Bgeu(rs1, rs2, offset),
+                _ => IllegalInstruction(current_ins),
+            }
+        }
+        0x67 => Jalr(rd, rs1, sign_extend12(imm)),
+        0x6f => {
+            let offset = (current_ins.bit(31) as u32) << 20
+                | current_ins.bit_range(12..20) << 12
+                | (current_ins.bit(20) as u32) << 11
+                | current_ins.bit_range(21..31) << 1;
+            let s_offset = sign_extend(offset.into(), 21);
+            trace!("offset: {offset:#020b}");
+            Jal(rd, s_offset)
+        }
+        0x73 => decode_system_instruction(current_ins, rd, rs1, imm, funct3),
+        _ => IllegalInstruction(current_ins),
+    }
+}
+
+#[inline]
+fn decode_op_instruction(
+    current_ins: u32,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    funct3: u32,
+    funct7: u32,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    match (funct7, funct3) {
+        (0x00, 0) => Add(rd, rs1, rs2),
+        (0x00, 1) => Sll(rd, rs1, rs2),
+        (0x00, 2) => Slt(rd, rs1, rs2),
+        (0x00, 3) => Sltu(rd, rs1, rs2),
+        (0x00, 4) => Xor(rd, rs1, rs2),
+        (0x00, 5) => Srl(rd, rs1, rs2),
+        (0x00, 6) => Or(rd, rs1, rs2),
+        (0x00, 7) => And(rd, rs1, rs2),
+        (0x20, 0) => Sub(rd, rs1, rs2),
+        (0x20, 5) => Sra(rd, rs1, rs2),
+        (0x01, 0) => Mul(rd, rs1, rs2),
+        (0x01, 1) => Mulh(rd, rs1, rs2),
+        (0x01, 2) => Mulhsu(rd, rs1, rs2),
+        (0x01, 3) => Mulhu(rd, rs1, rs2),
+        (0x01, 4) => Div(rd, rs1, rs2),
+        (0x01, 5) => Divu(rd, rs1, rs2),
+        (0x01, 6) => Rem(rd, rs1, rs2),
+        (0x01, 7) => Remu(rd, rs1, rs2),
+        _ => IllegalInstruction(current_ins),
+    }
+}
+
+#[inline]
+fn decode_op32_instruction(
+    current_ins: u32,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    funct3: u32,
+    funct7: u32,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    match (funct7, funct3) {
+        (0x00, 0) => Addw(rd, rs1, rs2),
+        (0x00, 1) => Sllw(rd, rs1, rs2),
+        (0x00, 5) => Srlw(rd, rs1, rs2),
+        (0x20, 0) => Subw(rd, rs1, rs2),
+        (0x20, 5) => Sraw(rd, rs1, rs2),
+        (0x01, 0) => Mulw(rd, rs1, rs2),
+        (0x01, 4) => Divw(rd, rs1, rs2),
+        (0x01, 5) => Divuw(rd, rs1, rs2),
+        (0x01, 6) => Remw(rd, rs1, rs2),
+        (0x01, 7) => Remuw(rd, rs1, rs2),
+        _ => IllegalInstruction(current_ins),
+    }
+}
+
+#[inline]
+fn decode_atomic_instruction(
+    current_ins: u32,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    funct3: u32,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    let funct5 = current_ins.bit_range(27..32);
+    if funct5 == 0b00010 && rs2 != 0 {
+        return IllegalInstruction(current_ins);
+    }
+
+    match (funct3, funct5) {
+        (2, 0b00010) => Lrw(rd, rs1),
+        (2, 0b00011) => Scw(rd, rs1, rs2),
+        (2, 0b00001) => Amoswapw(rd, rs1, rs2),
+        (2, 0b00000) => Amoaddw(rd, rs1, rs2),
+        (2, 0b00100) => Amoxorw(rd, rs1, rs2),
+        (2, 0b01100) => Amoandw(rd, rs1, rs2),
+        (2, 0b01000) => Amoorw(rd, rs1, rs2),
+        (2, 0b10000) => Amominw(rd, rs1, rs2),
+        (2, 0b10100) => Amomaxw(rd, rs1, rs2),
+        (2, 0b11000) => Amominuw(rd, rs1, rs2),
+        (2, 0b11100) => Amomaxuw(rd, rs1, rs2),
+        (3, 0b00010) => Lrd(rd, rs1),
+        (3, 0b00011) => Scd(rd, rs1, rs2),
+        (3, 0b00001) => Amoswapd(rd, rs1, rs2),
+        (3, 0b00000) => Amoaddd(rd, rs1, rs2),
+        (3, 0b00100) => Amoxord(rd, rs1, rs2),
+        (3, 0b01100) => Amoandd(rd, rs1, rs2),
+        (3, 0b01000) => Amoord(rd, rs1, rs2),
+        (3, 0b10000) => Amomind(rd, rs1, rs2),
+        (3, 0b10100) => Amomaxd(rd, rs1, rs2),
+        (3, 0b11000) => Amominud(rd, rs1, rs2),
+        (3, 0b11100) => Amomaxud(rd, rs1, rs2),
+        _ => IllegalInstruction(current_ins),
+    }
+}
+
+#[inline]
+fn decode_float_op_instruction(
+    current_ins: u32,
+    rd: Reg,
+    rm: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    funct3: u32,
+    funct7: u32,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    match funct7 {
+        0x00 => Fadds(rd, rm, rs1, rs2),
+        0x01 => Faddd(rd, rm, rs1, rs2),
+        0x04 => Fsubs(rd, rm, rs1, rs2),
+        0x05 => Fsubd(rd, rm, rs1, rs2),
+        0x08 => Fmuls(rd, rm, rs1, rs2),
+        0x09 => Fmuld(rd, rm, rs1, rs2),
+        0x0c => Fdivs(rd, rm, rs1, rs2),
+        0x0d => Fdivd(rd, rm, rs1, rs2),
+        0x10 => match funct3 {
+            0 => Fsgnjs(rd, rs1, rs2),
+            1 => Fsgnjns(rd, rs1, rs2),
+            2 => Fsgnjxs(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x11 => match funct3 {
+            0 => Fsgnjd(rd, rs1, rs2),
+            1 => Fsgnjnd(rd, rs1, rs2),
+            2 => Fsgnjxd(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x14 => match funct3 {
+            0 => Fmins(rd, rs1, rs2),
+            1 => Fmaxs(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x15 => match funct3 {
+            0 => Fmind(rd, rs1, rs2),
+            1 => Fmaxd(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x20 => match rs2 {
+            1 => Fcvtsd(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x21 => match rs2 {
+            0 => Fcvtds(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x2c => Fsqrts(rd, rm, rs1),
+        0x2d => Fsqrtd(rd, rm, rs1),
+        0x50 => match funct3 {
+            0 => Fles(rd, rs1, rs2),
+            1 => Flts(rd, rs1, rs2),
+            2 => Feqs(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x51 => match funct3 {
+            0 => Fled(rd, rs1, rs2),
+            1 => Fltd(rd, rs1, rs2),
+            2 => Feqd(rd, rs1, rs2),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x60 => match rs2 {
+            0 => Fcvtws(rd, rm, rs1),
+            1 => Fcvtwus(rd, rm, rs1),
+            2 => Fcvtls(rd, rm, rs1),
+            3 => Fcvtlus(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x61 => match rs2 {
+            0 => Fcvtwd(rd, rm, rs1),
+            1 => Fcvtwud(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x68 => match rs2 {
+            0 => Fcvtsw(rd, rm, rs1),
+            1 => Fcvtswu(rd, rm, rs1),
+            2 => Fcvtsl(rd, rm, rs1),
+            3 => Fcvtslu(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x69 => match rs2 {
+            0 => Fcvtdw(rd, rm, rs1),
+            1 => Fcvtdwu(rd, rm, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x70 => match (funct3, rs2) {
+            (0, 0) => Fmvxw(rd, rs1),
+            (1, 0) => Fclasss(rd, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x71 => match (funct3, rs2) {
+            (0, 0) => Fmvxd(rd, rs1),
+            (1, 0) => Fclassd(rd, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x78 => match (funct3, rs2) {
+            (0, 0) => Fmvwx(rd, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        _ => IllegalInstruction(current_ins),
+    }
+}
+
+#[inline]
+fn decode_system_instruction(
+    current_ins: u32,
+    rd: Reg,
+    rs1: Reg,
+    imm: Imm,
+    funct3: u32,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    match current_ins {
+        0x0000_0073 => Ecall,
+        0x0010_0073 => Ebreak,
+        _ => match funct3 {
+            1 => Csrrw(rd, rs1, imm as Csr),
+            2 => Csrrs(rd, rs1, imm as Csr),
+            3 => Csrrc(rd, rs1, imm as Csr),
+            5 => Csrrwi(rd, rs1 as Imm, imm as Csr),
+            6 => Csrrsi(rd, rs1 as Imm, imm as Csr),
+            7 => Csrrci(rd, rs1 as Imm, imm as Csr),
+            _ => IllegalInstruction(current_ins),
+        },
+    }
+}
+
+#[inline]
+fn decode_compressed_instruction(c_ins: u16) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    let c_rs1 = c_ins.bit_range(7..12) as Reg;
+    let x_rs1 = c_ins.bit_range(7..10) as Reg;
+    let x2_rs1 = c_ins.bit_range(2..5) as Reg;
+    let c_rs2 = c_ins.bit_range(2..7) as Reg;
+    let quadrant = c_ins & 0b11;
+    let funct3 = c_ins.bit_range(13..16);
+
+    match (quadrant, funct3) {
+        (0, 0) => {
+            let imm = u32::from(c_ins.bit_range(7..11)) << 6
+                | u32::from(c_ins.bit_range(11..13)) << 4
+                | (c_ins.bit(5) as u32) << 3
+                | (c_ins.bit(6) as u32) << 2;
+            trace!("c.addi4spn opcode: {c_ins:04x}");
+            Caddi4spn(x2_rs1 + 8, imm)
+        }
+        (0, 1) => {
+            let imm = (c_ins.bit_range(5..7) as u32) << 6 | (c_ins.bit_range(10..13) as u32) << 3;
+            Cfld(x2_rs1 + 8, x_rs1 + 8, imm)
+        }
+        (0, 2) => {
+            let imm = (c_ins.bit(5) as u32) << 6
+                | (c_ins.bit_range(10..13) as u32) << 3
+                | (c_ins.bit(6) as u32) << 2;
+            Clw(x2_rs1 + 8, x_rs1 + 8, imm)
+        }
+        (0, 3) => {
+            let imm = (c_ins.bit_range(5..7) as u32) << 6 | (c_ins.bit_range(10..13) as u32) << 3;
+            Cld(x2_rs1 + 8, x_rs1 + 8, imm)
+        }
+        (0, 5) => {
+            let imm = c_ins.bit_range(5..7) << 6 | c_ins.bit_range(10..13) << 3;
+            Cfsd(x_rs1 + 8, x2_rs1 + 8, imm.into())
+        }
+        (0, 6) => {
+            let imm = (c_ins.bit(5) as u32) << 6
+                | (c_ins.bit_range(10..13) as u32) << 3
+                | (c_ins.bit(6) as u32) << 2;
+            Csw(x_rs1 + 8, x2_rs1 + 8, imm)
+        }
+        (0, 7) => {
+            let imm = (c_ins.bit_range(5..7) as u32) << 6 | (c_ins.bit_range(10..13) as u32) << 3;
+            Csd(x_rs1 + 8, x2_rs1 + 8, imm)
+        }
+        (1, 0) if c_ins == 0x0001 => Cnop,
+        (1, 0) => {
+            let simm = sign_extend(compressed_ci_imm(c_ins).into(), 6);
+            Caddi(c_rs1, simm)
+        }
+        (1, 1) => {
+            let simm = sign_extend(compressed_ci_imm(c_ins).into(), 6);
+            Caddiw(c_rs1, simm)
+        }
+        (1, 2) => {
+            trace!("c.li instruction: {c_ins:04x}");
+            Cli(c_rs1, compressed_ci_imm(c_ins))
+        }
+        (1, 3) if c_rs1 == Sp as Reg => {
+            let imm = (c_ins.bit(12) as u32) << 9
+                | (c_ins.bit_range(3..5) as u32) << 7
+                | (c_ins.bit(5) as u32) << 6
+                | (c_ins.bit(2) as u32) << 5
+                | (c_ins.bit(6) as u32) << 4;
+            Caddi16sp(sign_extend(imm as u64, 10))
+        }
+        (1, 3) => {
+            let imm = (c_ins.bit(12) as u32) << 17 | u32::from(c_ins.bit_range(2..7)) << 12;
+            trace!("c.lui imm: {}", sign_extend(imm as u64, 18));
+            Clui(c_rs1, imm)
+        }
+        (1, 4) => decode_compressed_alu_instruction(c_ins, x_rs1, x2_rs1),
+        (1, 5) => Cj(compressed_jump_offset(c_ins)),
+        (1, 6) => {
+            let imm = compressed_branch_offset(c_ins);
+            trace!("beqz imm: {imm}");
+            Cbeqz(x_rs1 + 8, imm)
+        }
+        (1, 7) => Cbnez(x_rs1 + 8, compressed_branch_offset(c_ins)),
+        (2, 0) => Cslli(c_rs1, compressed_ci_imm(c_ins)),
+        (2, 1) => {
+            let imm = (c_ins.bit_range(2..5) as u32) << 6
+                | (c_ins.bit(12) as u32) << 5
+                | (c_ins.bit_range(5..7) as u32) << 3;
+            Cfldsp(c_rs1, imm)
+        }
+        (2, 2) => {
+            let imm = (c_ins.bit_range(2..4) as u32) << 6
+                | (c_ins.bit(12) as u32) << 5
+                | (c_ins.bit_range(4..7) as u32) << 2;
+            trace!("c.lwsp opcode: {c_ins:04x}");
+            Clwsp(c_rs1, imm)
+        }
+        (2, 3) => {
+            let imm = (c_ins.bit_range(2..5) as u32) << 6
+                | (c_ins.bit(12) as u32) << 5
+                | (c_ins.bit_range(5..7) as u32) << 3;
+            trace!("c.ldsp opcode: {c_ins:04x}");
+            Cldsp(c_rs1, imm)
+        }
+        (2, 4) => decode_compressed_jump_register_instruction(c_ins, c_rs1, c_rs2),
+        (2, 5) => {
+            let imm = c_ins.bit_range(7..10) << 6 | c_ins.bit_range(10..13) << 3;
+            Cfsdsp(c_rs2, imm.into())
+        }
+        (2, 6) => {
+            let imm = c_ins.bit_range(7..9) << 6 | c_ins.bit_range(9..13) << 2;
+            Cswsp(c_rs2, imm.into())
+        }
+        (2, 7) => {
+            let imm = (c_ins.bit_range(7..10) as u32) << 6 | (c_ins.bit_range(10..13) as u32) << 3;
+            Csdsp(c_rs2, imm)
+        }
+        _ => IllegalInstruction(c_ins.into()),
+    }
+}
+
+#[inline]
+fn decode_compressed_alu_instruction(c_ins: u16, x_rs1: Reg, x2_rs1: Reg) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    let rd = x_rs1 + 8;
+    let rs2 = x2_rs1 + 8;
+    match c_ins.bit_range(10..12) {
+        0 => Csrli(rd, compressed_ci_imm(c_ins)),
+        1 => Csrai(rd, compressed_ci_imm(c_ins)),
+        2 => Candi(rd, sign_extend(compressed_ci_imm(c_ins).into(), 6)),
+        3 => match (c_ins.bit(12), c_ins.bit_range(5..7)) {
+            (false, 0) => Csub(rd, rs2),
+            (false, 1) => Cxor(rd, rs2),
+            (false, 2) => Cor(rd, rs2),
+            (false, 3) => Cand(rd, rs2),
+            (true, 0) => Csubw(rd, rs2),
+            (true, 1) => Caddw(rd, rs2),
+            _ => IllegalInstruction(c_ins.into()),
+        },
+        _ => IllegalInstruction(c_ins.into()),
+    }
+}
+
+#[inline]
+fn decode_compressed_jump_register_instruction(
+    c_ins: u16,
+    c_rs1: Reg,
+    c_rs2: Reg,
+) -> RV64GCInstruction {
+    use RV64GCInstruction::*;
+
+    if !c_ins.bit(12) {
+        if c_rs2 == 0 {
+            Cjr(c_rs1)
+        } else {
+            trace!("c.mv opcode: {c_ins:04x}");
+            Cmv(c_rs1, c_rs2)
+        }
+    } else if c_rs1 == 0 && c_rs2 == 0 {
+        Cebreak
+    } else if c_rs2 == 0 {
+        Cjalr(c_rs1)
+    } else {
+        Cadd(c_rs1, c_rs2)
+    }
+}
+
+#[inline]
+fn store_offset(ins: u32) -> Imm {
+    (ins.bit_range(25..32) << 5) | ins.bit_range(7..12)
+}
+
+#[inline]
+fn branch_offset(ins: u32) -> Imm {
+    (ins.bit(31) as u32) << 12
+        | (ins.bit(7) as u32) << 11
+        | ins.bit_range(25..31) << 5
+        | ins.bit_range(8..12) << 1
+}
+
+#[inline]
+fn compressed_ci_imm(c_ins: u16) -> Imm {
+    (c_ins.bit(12) as u32) << 5 | u32::from(c_ins.bit_range(2..7))
+}
+
+#[inline]
+fn compressed_branch_offset(c_ins: u16) -> Imm {
+    (c_ins.bit(12) as u32) << 8
+        | (c_ins.bit_range(5..7) as u32) << 6
+        | (c_ins.bit(2) as u32) << 5
+        | (c_ins.bit_range(10..12) as u32) << 3
+        | (c_ins.bit_range(3..5) as u32) << 1
+}
+
+#[inline]
+fn compressed_jump_offset(c_ins: u16) -> Imm {
+    (c_ins.bit(12) as u32) << 11
+        | (c_ins.bit(8) as u32) << 10
+        | (c_ins.bit_range(9..11) as u32) << 8
+        | (c_ins.bit(6) as u32) << 7
+        | (c_ins.bit(7) as u32) << 6
+        | (c_ins.bit(2) as u32) << 5
+        | (c_ins.bit(11) as u32) << 4
+        | (c_ins.bit_range(3..6) as u32) << 1
 }
 
 #[derive(Debug)]
@@ -568,633 +1158,7 @@ impl RV64GC {
     }
 
     pub fn find_instruction(&self, current_ins: u32) -> RV64GCInstruction {
-        use RV64GCInstruction::*;
-
-        // Default values
-        let rd = current_ins.bit_range(7..12) as Reg;
-        let rs1 = current_ins.bit_range(15..20) as Reg;
-        let rs2 = current_ins.bit_range(20..25) as Reg;
-        let rs3 = current_ins.bit_range(27..32) as Reg;
-        let imm = current_ins.bit_range(20..32) as Imm;
-
-        let rm = current_ins.bit_range(12..15) as Reg;
-
-        if current_ins & 0b11 != 0b11 {
-            let c_ins = current_ins as u16;
-            let c_rs1 = c_ins.bit_range(7..12) as Reg;
-            let x_rs1 = c_ins.bit_range(7..10) as Reg;
-            let x2_rs1 = c_ins.bit_range(2..5) as Reg;
-            let c_rs2 = c_ins.bit_range(2..7) as Reg;
-
-            return match c_ins {
-                i if is_rv64c_nop_instruction(i) => Cnop,
-                i if is_rv64c_ebreak_instruction(i) => Cebreak,
-                i if is_rv64c_jalr_instruction(i) => Cjalr(c_rs1),
-                i if is_rv64c_add_instruction(i) => Cadd(c_rs1, c_rs2),
-
-                i if is_rv64c_jr_instruction(i) => Cjr(c_rs1),
-                i if is_rv64c_mv_instruction(i) => {
-                    trace!("c.mv opcode: {i:04x}");
-                    Cmv(c_rs1, c_rs2)
-                }
-
-                i if is_rv64c_addi_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | (i.bit_range(2..7) as u32);
-                    let simm = sign_extend(imm.into(), 6);
-
-                    Caddi(c_rs1, simm)
-                }
-
-                i if is_rv64c_addiw_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | (i.bit_range(2..7) as u32);
-                    let simm = sign_extend(imm.into(), 6);
-
-                    Caddiw(c_rs1, simm)
-                }
-
-                i if is_rv64c_addi16sp_instruction(i) => {
-                    let imm = (i.bit(12) as u16) << 9
-                        | i.bit_range(3..5) << 7
-                        | (i.bit(5) as u16) << 6
-                        | (i.bit(2) as u16) << 5
-                        | (i.bit(6) as u16) << 4;
-
-                    Caddi16sp(sign_extend(imm as u64, 10))
-                }
-
-                i if is_rv64c_lui_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 17 | u32::from(i.bit_range(2..7)) << 12;
-
-                    trace!("c.lui imm: {}", sign_extend(imm as u64, 18));
-
-                    Clui(c_rs1, imm)
-                }
-
-                i if is_rv64c_andi_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | u32::from(i.bit_range(2..7));
-                    let simm = sign_extend(imm.into(), 6);
-                    Candi(x_rs1 + 8, simm)
-                }
-
-                i if is_rv64c_ldsp_instruction(i) => {
-                    let imm = (i.bit_range(2..5) as u32) << 6
-                        | (i.bit(12) as u32) << 5
-                        | (i.bit_range(5..7) as u32) << 3;
-
-                    trace!("c.ldsp opcode: {i:04x}");
-
-                    Cldsp(c_rs1, imm)
-                }
-
-                i if is_rv64c_fldsp_instruction(i) => {
-                    let imm = (i.bit_range(2..5) as u32) << 6
-                        | (i.bit(12) as u32) << 5
-                        | (i.bit_range(5..7) as u32) << 3;
-
-                    Cfldsp(c_rs1, imm)
-                }
-
-                i if is_rv64c_lwsp_instruction(i) => {
-                    let imm = (i.bit_range(2..4) as u32) << 6
-                        | (i.bit(12) as u32) << 5
-                        | (i.bit_range(4..7) as u32) << 2;
-
-                    trace!("c.lwsp opcode: {i:04x}");
-
-                    Clwsp(c_rs1, imm)
-                }
-
-                i if is_rv64c_swsp_instruction(i) => {
-                    let imm = i.bit_range(7..9) << 6 | i.bit_range(9..13) << 2;
-
-                    Cswsp(c_rs2, imm.into())
-                }
-
-                i if is_rv64c_addi4spn_instruction(i) => {
-                    let imm = u32::from(i.bit_range(7..11)) << 6
-                        | u32::from(i.bit_range(11..13)) << 4
-                        | (i.bit(5) as u32) << 3
-                        | (i.bit(6) as u32) << 2;
-
-                    trace!("c.addi4spn opcode: {i:04x}");
-
-                    Caddi4spn(x2_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_li_instruction(i) => {
-                    trace!("c.li instruction: {:04x}", i);
-                    let imm = (i.bit(12) as u32) << 5 | u32::from(i.bit_range(2..7));
-                    Cli(c_rs1, imm)
-                }
-
-                i if is_rv64c_slli_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | u32::from(i.bit_range(2..7));
-                    Cslli(c_rs1, imm)
-                }
-
-                i if is_rv64c_srli_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | u32::from(i.bit_range(2..7));
-                    Csrli(x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_srai_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 5 | u32::from(i.bit_range(2..7));
-                    Csrai(x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_sdsp_instruction(i) => {
-                    let imm = (i.bit_range(7..10) as u32) << 6 | (i.bit_range(10..13) as u32) << 3;
-
-                    Csdsp(c_rs2, imm)
-                }
-
-                i if is_rv64c_ld_instruction(i) => {
-                    let imm = (i.bit_range(5..7) as u32) << 6 | (i.bit_range(10..13) as u32) << 3;
-
-                    Cld(x2_rs1 + 8, x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_fld_instruction(i) => {
-                    let imm = (i.bit_range(5..7) as u32) << 6 | (i.bit_range(10..13) as u32) << 3;
-
-                    Cfld(x2_rs1 + 8, x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_beqz_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 8
-                        | (i.bit_range(5..7) as u32) << 6
-                        | (i.bit(2) as u32) << 5
-                        | (i.bit_range(10..12) as u32) << 3
-                        | (i.bit_range(3..5) as u32) << 1;
-
-                    trace!("beqz imm: {imm}");
-
-                    Cbeqz(x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_bnez_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 8
-                        | (i.bit_range(5..7) as u32) << 6
-                        | (i.bit(2) as u32) << 5
-                        | (i.bit_range(10..12) as u32) << 3
-                        | (i.bit_range(3..5) as u32) << 1;
-
-                    Cbnez(x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_sd_instruction(i) => {
-                    let imm = (i.bit_range(5..7) as u32) << 6 | (i.bit_range(10..13) as u32) << 3;
-
-                    Csd(x_rs1 + 8, x2_rs1 + 8, imm)
-                }
-
-                // Wtf is this bit layout????
-                // [ 11 | 4 | 9 | 8 | 10 | 6 | 7 | 3 | 2 | 1 | 5 ]
-                //   12  11  10   9    8   7   6   5   4   3   2
-                i if is_rv64c_j_instruction(i) => {
-                    let imm = (i.bit(12) as u32) << 11
-                        | (i.bit(8) as u32) << 10
-                        | (i.bit_range(9..11) as u32) << 8
-                        | (i.bit(6) as u32) << 7
-                        | (i.bit(7) as u32) << 6
-                        | (i.bit(2) as u32) << 5
-                        | (i.bit(11) as u32) << 4
-                        | (i.bit_range(3..6) as u32) << 1;
-
-                    Cj(imm)
-                }
-
-                i if is_rv64c_sw_instruction(i) => {
-                    let imm = (i.bit(5) as u32) << 6
-                        | (i.bit_range(10..13) as u32) << 3
-                        | (i.bit(6) as u32) << 2;
-
-                    Csw(x_rs1 + 8, x2_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_lw_instruction(i) => {
-                    let imm = (i.bit(5) as u32) << 6
-                        | (i.bit_range(10..13) as u32) << 3
-                        | (i.bit(6) as u32) << 2;
-
-                    // NOTE: Rd is swapped for some reason
-                    Clw(x2_rs1 + 8, x_rs1 + 8, imm)
-                }
-
-                i if is_rv64c_or_instruction(i) => Cor(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_and_instruction(i) => Cand(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_xor_instruction(i) => Cxor(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_sub_instruction(i) => Csub(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_addw_instruction(i) => Caddw(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_subw_instruction(i) => Csubw(x_rs1 + 8, x2_rs1 + 8),
-
-                i if is_rv64c_fsd_instruction(i) => {
-                    let imm = i.bit_range(5..7) << 6 | i.bit_range(10..13) << 3;
-                    Cfsd(x_rs1 + 8, x2_rs1 + 8, imm.into())
-                }
-
-                i if is_rv64c_fsdsp_instruction(i) => {
-                    let imm = i.bit_range(7..10) << 6 | i.bit_range(10..13) << 3;
-
-                    Cfsdsp(c_rs2, imm.into())
-                }
-
-                _ => IllegalInstruction(c_ins.into()),
-            };
-        }
-        match current_ins {
-            i if is_rv64i_add_instruction(i) => Add(rd, rs1, rs2),
-
-            i if is_rv64i_addi_instruction(i) => Addi(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_auipc_instruction(i) => {
-                let ov_imm = i.bit_range(12..32) << 12;
-                Auipc(rd, sign_extend(ov_imm.into(), 32))
-            }
-
-            i if is_rv64i_lui_instruction(i) => {
-                let ov_imm = i.bit_range(12..32) << 12;
-                Lui(rd, sign_extend(ov_imm.into(), 32))
-            }
-
-            i if is_rv64i_slti_instruction(i) => Slti(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_sltiu_instruction(i) => Sltiu(rd, rs1, imm),
-
-            i if is_rv64i_xori_instruction(i) => Xori(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_ori_instruction(i) => Ori(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_andi_instruction(i) => Andi(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_slli_instruction(i) => {
-                let shamt = i.bit_range(20..26);
-                Slli(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_srli_instruction(i) => {
-                let shamt = i.bit_range(20..26);
-                Srli(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_srai_instruction(i) => {
-                let shamt = i.bit_range(20..26);
-                Srai(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_sll_instruction(i) => Sll(rd, rs1, rs2),
-
-            i if is_rv64i_srl_instruction(i) => Srl(rd, rs1, rs2),
-
-            i if is_rv64i_sra_instruction(i) => Sra(rd, rs1, rs2),
-
-            i if is_rv64i_slt_instruction(i) => Slt(rd, rs1, rs2),
-
-            i if is_rv64i_sltu_instruction(i) => Sltu(rd, rs1, rs2),
-
-            i if is_rv64i_sub_instruction(i) => Sub(rd, rs1, rs2),
-
-            i if is_rv64i_xor_instruction(i) => Xor(rd, rs1, rs2),
-
-            i if is_rv64i_and_instruction(i) => And(rd, rs1, rs2),
-
-            i if is_rv64i_or_instruction(i) => Or(rd, rs1, rs2),
-
-            i if is_rv64i_ecall_instruction(i) => Ecall,
-
-            i if is_rv64i_ebreak_instruction(i) => Ebreak,
-
-            i if is_rv64i_fence_instruction(i) => {
-                Fence(i.bit_range(20..24) as u8, i.bit_range(24..28) as u8)
-            }
-
-            i if is_rv64i_fencei_instruction(i) => FenceI,
-
-            i if is_rv64i_csrrw_instruction(i) => Csrrw(rd, rs1, imm as Csr),
-            i if is_rv64i_csrrs_instruction(i) => Csrrs(rd, rs1, imm as Csr),
-            i if is_rv64i_csrrc_instruction(i) => Csrrc(rd, rs1, imm as Csr),
-            i if is_rv64i_csrrwi_instruction(i) => Csrrwi(rd, rs1 as Imm, imm as Csr),
-            i if is_rv64i_csrrsi_instruction(i) => Csrrsi(rd, rs1 as Imm, imm as Csr),
-            i if is_rv64i_csrrci_instruction(i) => Csrrci(rd, rs1 as Imm, imm as Csr),
-
-            i if is_rv64i_lb_instruction(i) => Lb(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_lh_instruction(i) => Lh(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_lbu_instruction(i) => Lbu(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_lhu_instruction(i) => Lhu(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_sb_instruction(i) => {
-                let lo_offset = i.bit_range(7..12);
-                let hi_offset = i.bit_range(25..32);
-
-                let offset = (hi_offset << 5) | lo_offset;
-
-                Sb(rs1, rs2, sign_extend12(offset))
-            }
-
-            i if is_rv64i_sh_instruction(i) => {
-                let lo_offset = i.bit_range(7..12);
-                let hi_offset = i.bit_range(25..32);
-
-                let offset = (hi_offset << 5) | lo_offset;
-
-                Sh(rs1, rs2, sign_extend12(offset))
-            }
-
-            i if is_rv64i_lw_instruction(i) => Lw(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_sw_instruction(i) => {
-                let lo_offset = i.bit_range(7..12);
-                let hi_offset = i.bit_range(25..32);
-
-                let offset = (hi_offset << 5) | lo_offset;
-
-                Sw(rs1, rs2, sign_extend12(offset))
-            }
-
-            i if is_rv64i_ld_instruction(i) => Ld(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_sd_instruction(i) => {
-                let lo_offset = i.bit_range(7..12);
-                let hi_offset = i.bit_range(25..32);
-
-                let offset = (hi_offset << 5) | lo_offset;
-
-                Sd(rs1, rs2, sign_extend12(offset))
-            }
-
-            i if is_rv64i_jal_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 20
-                    | i.bit_range(12..20) << 12
-                    | (i.bit(20) as u32) << 11
-                    | i.bit_range(21..31) << 1;
-
-                let s_offset = sign_extend(offset.into(), 21);
-
-                trace!("offset: {:#020b}", offset);
-                Jal(rd, s_offset)
-            }
-
-            i if is_rv64i_jalr_instruction(i) => Jalr(rd, rs1, sign_extend12(imm)),
-
-            i if is_rv64i_bge_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Bge(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_bgeu_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Bgeu(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_beq_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Beq(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_bne_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Bne(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_blt_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Blt(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_bltu_instruction(i) => {
-                let offset = (i.bit(31) as u32) << 12
-                    | (i.bit(7) as u32) << 11
-                    | i.bit_range(25..31) << 5
-                    | i.bit_range(8..12) << 1;
-
-                Bltu(rs1, rs2, offset)
-            }
-
-            i if is_rv64i_addiw_instruction(i) => Addiw(rd, rs1, imm),
-
-            i if is_rv64i_slliw_instruction(i) => {
-                let shamt = current_ins.bit_range(20..26);
-
-                Slliw(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_srliw_instruction(i) => {
-                let shamt = current_ins.bit_range(20..26);
-
-                Srliw(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_sraiw_instruction(i) => {
-                let shamt = i.bit_range(20..25);
-
-                Sraiw(rd, rs1, shamt)
-            }
-
-            i if is_rv64i_addw_instruction(i) => Addw(rd, rs1, rs2),
-
-            i if is_rv64i_subw_instruction(i) => Subw(rd, rs1, rs2),
-
-            i if is_rv64i_sllw_instruction(i) => Sllw(rd, rs1, rs2),
-
-            i if is_rv64i_srlw_instruction(i) => Srlw(rd, rs1, rs2),
-
-            i if is_rv64i_sraw_instruction(i) => Sraw(rd, rs1, rs2),
-
-            i if is_rv64i_lwu_instruction(i) => Lwu(rd, rs1, imm),
-
-            i if is_rv64m_mul_instruction(i) => Mul(rd, rs1, rs2),
-
-            i if is_rv64m_mulh_instruction(i) => Mulh(rd, rs1, rs2),
-
-            i if is_rv64m_mulhsu_instruction(i) => Mulhsu(rd, rs1, rs2),
-
-            i if is_rv64m_mulhu_instruction(i) => Mulhu(rd, rs1, rs2),
-
-            i if is_rv64m_div_instruction(i) => Div(rd, rs1, rs2),
-
-            i if is_rv64m_divu_instruction(i) => Divu(rd, rs1, rs2),
-
-            i if is_rv64m_rem_instruction(i) => Rem(rd, rs1, rs2),
-
-            i if is_rv64m_remu_instruction(i) => Remu(rd, rs1, rs2),
-
-            i if is_rv64m_mulw_instruction(i) => Mulw(rd, rs1, rs2),
-
-            i if is_rv64m_divw_instruction(i) => Divw(rd, rs1, rs2),
-
-            i if is_rv64m_divuw_instruction(i) => Divuw(rd, rs1, rs2),
-
-            i if is_rv64m_remw_instruction(i) => Remw(rd, rs1, rs2),
-
-            i if is_rv64m_remuw_instruction(i) => Remuw(rd, rs1, rs2),
-
-            i if is_rv64a_lrw_instruction(i) => Lrw(rd, rs1),
-
-            i if is_rv64a_lrd_instruction(i) => Lrd(rd, rs1),
-
-            i if is_rv64a_scw_instruction(i) => Scw(rd, rs1, rs2),
-
-            i if is_rv64a_scd_instruction(i) => Scd(rd, rs1, rs2),
-
-            i if is_rv64a_amoswapw_instruction(i) => Amoswapw(rd, rs1, rs2),
-
-            i if is_rv64a_amoaddw_instruction(i) => Amoaddw(rd, rs1, rs2),
-
-            i if is_rv64a_amoxorw_instruction(i) => Amoxorw(rd, rs1, rs2),
-
-            i if is_rv64a_amoandw_instruction(i) => Amoandw(rd, rs1, rs2),
-
-            i if is_rv64a_amoorw_instruction(i) => Amoorw(rd, rs1, rs2),
-
-            i if is_rv64a_amominw_instruction(i) => Amominw(rd, rs1, rs2),
-
-            i if is_rv64a_amomaxw_instruction(i) => Amomaxw(rd, rs1, rs2),
-
-            i if is_rv64a_amominuw_instruction(i) => Amominuw(rd, rs1, rs2),
-
-            i if is_rv64a_amomaxuw_instruction(i) => Amomaxuw(rd, rs1, rs2),
-
-            i if is_rv64a_amoswapd_instruction(i) => Amoswapd(rd, rs1, rs2),
-
-            i if is_rv64a_amoaddd_instruction(i) => Amoaddd(rd, rs1, rs2),
-
-            i if is_rv64a_amoxord_instruction(i) => Amoxord(rd, rs1, rs2),
-
-            i if is_rv64a_amoandd_instruction(i) => Amoandd(rd, rs1, rs2),
-
-            i if is_rv64a_amoord_instruction(i) => Amoord(rd, rs1, rs2),
-
-            i if is_rv64a_amomind_instruction(i) => Amomind(rd, rs1, rs2),
-
-            i if is_rv64a_amomaxd_instruction(i) => Amomaxd(rd, rs1, rs2),
-
-            i if is_rv64a_amominud_instruction(i) => Amominud(rd, rs1, rs2),
-
-            i if is_rv64a_amomaxud_instruction(i) => Amomaxud(rd, rs1, rs2),
-
-            // RV64F
-            i if is_rv64f_fmadds_instruction(i) => Fmadds(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fmsubs_instruction(i) => Fmsubs(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fnmadds_instruction(i) => Fnmadds(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fnmsubs_instruction(i) => Fnmsubs(rd, rm, rs1, rs2, rs3),
-
-            i if is_rv64f_fadds_instruction(i) => Fadds(rd, rm, rs1, rs2),
-            i if is_rv64f_fsubs_instruction(i) => Fsubs(rd, rm, rs1, rs2),
-            i if is_rv64f_fmuls_instruction(i) => Fmuls(rd, rm, rs1, rs2),
-            i if is_rv64f_fdivs_instruction(i) => Fdivs(rd, rm, rs1, rs2),
-            i if is_rv64f_fsqrts_instruction(i) => Fsqrts(rd, rm, rs1),
-
-            i if is_rv64f_fsgnjs_instruction(i) => Fsgnjs(rd, rs1, rs2),
-            i if is_rv64f_fsgnjns_instruction(i) => Fsgnjns(rd, rs1, rs2),
-            i if is_rv64f_fsgnjxs_instruction(i) => Fsgnjxs(rd, rs1, rs2),
-
-            i if is_rv64f_fmins_instruction(i) => Fmins(rd, rs1, rs2),
-            i if is_rv64f_fmaxs_instruction(i) => Fmaxs(rd, rs1, rs2),
-
-            i if is_rv64f_fcvtws_instruction(i) => Fcvtws(rd, rm, rs1),
-            i if is_rv64f_fcvtwus_instruction(i) => Fcvtwus(rd, rm, rs1),
-            i if is_rv64f_fcvtls_instruction(i) => Fcvtls(rd, rm, rs1),
-            i if is_rv64f_fcvtlus_instruction(i) => Fcvtlus(rd, rm, rs1),
-            i if is_rv64f_fmvxw_instruction(i) => Fmvxw(rd, rs1),
-            i if is_rv64f_fmvwx_instruction(i) => Fmvwx(rd, rs1),
-
-            i if is_rv64f_feqs_instruction(i) => Feqs(rd, rs1, rs2),
-            i if is_rv64f_flts_instruction(i) => Flts(rd, rs1, rs2),
-            i if is_rv64f_fles_instruction(i) => Fles(rd, rs1, rs2),
-
-            i if is_rv64f_fclasss_instruction(i) => Fclasss(rd, rs1),
-
-            i if is_rv64f_fcvtsw_instruction(i) => Fcvtsw(rd, rm, rs1),
-            i if is_rv64f_fcvtswu_instruction(i) => Fcvtswu(rd, rm, rs1),
-            i if is_rv64f_fcvtsl_instruction(i) => Fcvtsl(rd, rm, rs1),
-            i if is_rv64f_fcvtslu_instruction(i) => Fcvtslu(rd, rm, rs1),
-
-            i if is_rv64f_flw_instruction(i) => {
-                trace!("flw: {i:08x}");
-                Flw(rd, rs1, imm)
-            }
-            i if is_rv64f_fsw_instruction(i) => {
-                let imm = i.bit_range(25..32) << 5 | i.bit_range(7..12);
-                trace!("fsw: {i:08x}");
-                trace!("imm: {}", sign_extend12(imm));
-
-                Fsw(rs1, rs2, imm)
-            }
-
-            // RV64D
-            i if is_rv64f_fmaddd_instruction(i) => Fmaddd(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fmsubd_instruction(i) => Fmsubd(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fnmaddd_instruction(i) => Fnmaddd(rd, rm, rs1, rs2, rs3),
-            i if is_rv64f_fnmsubd_instruction(i) => Fnmsubd(rd, rm, rs1, rs2, rs3),
-
-            i if is_rv64f_faddd_instruction(i) => Faddd(rd, rm, rs1, rs2),
-            i if is_rv64f_fsubd_instruction(i) => Fsubd(rd, rm, rs1, rs2),
-            i if is_rv64f_fmuld_instruction(i) => Fmuld(rd, rm, rs1, rs2),
-            i if is_rv64f_fdivd_instruction(i) => Fdivd(rd, rm, rs1, rs2),
-            i if is_rv64f_fsqrtd_instruction(i) => Fsqrtd(rd, rm, rs1),
-
-            i if is_rv64f_fld_instruction(i) => Fld(rd, rs1, imm),
-
-            i if is_rv64f_fsd_instruction(i) => {
-                let imm = i.bit_range(25..32) << 5 | i.bit_range(7..12);
-                let simm = sign_extend12(imm);
-
-                Fsd(rs1, rs2, simm)
-            }
-
-            i if is_rv64f_fsgnjd_instruction(i) => Fsgnjd(rd, rs1, rs2),
-
-            i if is_rv64f_fsgnjnd_instruction(i) => Fsgnjnd(rd, rs1, rs2),
-
-            i if is_rv64f_fsgnjxd_instruction(i) => Fsgnjxd(rd, rs1, rs2),
-
-            i if is_rv64f_fmind_instruction(i) => Fmind(rd, rs1, rs2),
-            i if is_rv64f_fmaxd_instruction(i) => Fmaxd(rd, rs1, rs2),
-
-            i if is_rv64f_feqd_instruction(i) => Feqd(rd, rs1, rs2),
-            i if is_rv64f_fltd_instruction(i) => Fltd(rd, rs1, rs2),
-            i if is_rv64f_fled_instruction(i) => Fled(rd, rs1, rs2),
-            i if is_rv64f_fclassd_instruction(i) => Fclassd(rd, rs1),
-
-            i if is_rv64f_fcvtsd_instruction(i) => Fcvtsd(rd, rm, rs1),
-            i if is_rv64f_fcvtds_instruction(i) => Fcvtds(rd, rm, rs1),
-            i if is_rv64f_fcvtwd_instruction(i) => Fcvtwd(rd, rm, rs1),
-            i if is_rv64f_fcvtwud_instruction(i) => Fcvtwud(rd, rm, rs1),
-            i if is_rv64f_fcvtdw_instruction(i) => Fcvtdw(rd, rm, rs1),
-            i if is_rv64f_fcvtdwu_instruction(i) => Fcvtdwu(rd, rm, rs1),
-
-            i if is_rv64f_fmvxd_instruction(i) => Fmvxd(rd, rs1),
-
-            _ => IllegalInstruction(current_ins),
-        }
+        decode_instruction(current_ins)
     }
 
     pub fn syscall_handler(&mut self) {
