@@ -91,6 +91,139 @@ engine label and CLI intent. Both modes allow runtime native compilation, both
 can dynamically recompile hot blocks, and both reject blocks that would require
 interpreter fallback.
 
+## Glossary
+
+This glossary defines terms as they are used in this document and codebase.
+
+- AArch64: The 64-bit ARM instruction set used by Apple Silicon and other ARM64
+  machines. RISCVM's native compiler currently emits AArch64 code.
+- AOT: Ahead-of-time compilation. In RISCVM this means compiling known guest
+  entry points before execution starts, while optionally allowing native lazy
+  misses later unless strict AOT is selected.
+- AOT miss: A guest PC reached in AOT mode that does not already have a compiled
+  native block. Strict AOT reports this as an error; default AOT can compile it
+  lazily.
+- AOT symbol entry: An ELF function symbol or PLT entry added to the AOT
+  precompile worklist as a possible block start.
+- backend: The host-code emitter. The current backend converts planned
+  `NativeInstruction` operations into executable AArch64 machine code.
+- baseline tier: The first and simplest JIT tier. It emits a native block with
+  minimal optimization so cold code can start running quickly.
+- block: A compiled unit keyed by a starting guest PC. It usually contains a
+  short straight-line sequence and stops at control flow, a fault, an unsupported
+  operation, or the block instruction limit.
+- block cache: The `JitEngine` map from guest start PC to `CompiledBlock`.
+  Runtime execution reuses cached blocks until they become stale or hot enough to
+  promote.
+- block fingerprint: The recorded `(pc, opcode)` sequence for a compiled block.
+  It lets the engine detect when self-modifying guest code has changed the
+  instructions a block was compiled from.
+- block plan: The compiler's intermediate plan for one block or region. It
+  records lowered native operations, fingerprints, exit behavior, and metadata
+  before the backend emits machine code.
+- branch folding: An optimization that replaces a branch whose result is already
+  known with a direct jump or fallthrough.
+- callee-saved register: A host register that a native block must restore before
+  returning if it uses it according to the host calling convention.
+- caller-saved register: A host register that can be clobbered by calls. Some
+  optimized leaf loops use caller-saved temporaries to avoid a normal prologue.
+- code version: A RAM-side counter that changes when executable guest memory is
+  modified. Decode and JIT caches use it to invalidate stale work.
+- cold row: A benchmark row that builds a fresh CPU and JIT engine for every
+  sample, so it measures startup, compilation, and execution together.
+- compiled block: Executable host code plus metadata such as its fingerprint,
+  tier, instruction count, native code length, and execution counters.
+- control flow: Instructions that can change the next guest PC, such as jumps,
+  branches, calls, returns, traps, and side exits.
+- CSR: Control and status register. RISC-V uses CSRs for architectural state such
+  as floating-point status and rounding mode.
+- dynamic recompilation: The process of replacing a cached baseline block with a
+  hotter optimized or trace block after it has executed enough times.
+- ecall: The RISC-V environment-call instruction. In user-mode emulation this is
+  how guest code requests a Linux-style syscall.
+- ELF: Executable and Linkable Format. The guest binaries loaded by RISCVM are
+  ELF files unless a raw `.bin` image is explicitly used.
+- executable memory: Host memory that contains emitted machine code and is marked
+  executable after code generation.
+- fallback: Executing code through another engine when native compilation cannot
+  handle it. Current JIT-family modes deliberately reject interpreter fallback.
+- fingerprint: See block fingerprint.
+- guest: The emulated RISC-V program and its architectural state.
+- guest PC: The RISC-V program counter, stored in the guest register file.
+- guest-visible state: State the emulated program can observe, including
+  registers, PC, memory, filesystem effects, stdout, stderr, exit status, and
+  runtime faults.
+- guard: A runtime check emitted by trace code to prove the current execution
+  still matches the path that was observed during tracing.
+- hot block: A cached block that has executed enough times to be considered for
+  optimization or trace compilation.
+- host: The machine running the emulator. On supported systems this is a Unix
+  AArch64 process.
+- host libc shortcut: An emulator-mediated fast path for recognized guest libc
+  symbols such as `printf`, `memcpy`, or `strlen`. It copies through guest memory
+  and filesystem abstractions rather than exposing arbitrary host state.
+- hybrid mode: The default native engine label on supported hosts. Today it uses
+  the same native-only runtime compilation behavior as JIT mode.
+- interpreter: The reference engine that decodes and executes one guest
+  instruction at a time without emitting host machine code.
+- interpreter fallback: Running unsupported native blocks in the interpreter.
+  Current JIT, hybrid, and AOT modes do not allow this.
+- JIT: Just-in-time compilation. RISCVM compiles guest code into native host code
+  as execution reaches new guest PCs.
+- lazy compile miss: Runtime compilation triggered because execution reached a
+  guest PC that was not already present in the block cache.
+- leaf function: A native block or region that does not call back into Rust
+  runtime helpers. Leaf regions can often use cheaper prologues.
+- linear sweep: An AOT discovery mode that scans executable ELF section ranges
+  for possible block starts, rather than following only known reachable control
+  flow.
+- lowering: Translating a decoded `RV64GCInstruction` into a `NativeInstruction`
+  that the backend can emit or route through a runtime helper.
+- native block: A compiled block of host machine code that executes guest
+  behavior directly.
+- native code: Machine code for the host CPU, currently AArch64.
+- opcode: The encoded guest instruction word or halfword read from guest memory.
+- optimized tier: A hotter JIT tier that runs generic optimizer passes and
+  backend-specific fast paths before emitting code.
+- PC: Program counter. In this document it usually means the guest PC unless
+  explicitly called a host address.
+- PLT: Procedure linkage table. ELF binaries use PLT entries for dynamically
+  linked calls; AOT can seed them as possible entry points.
+- precompile: Compile native blocks before execution reaches them. AOT mode
+  precompiles at least the entry PC before starting execution.
+- prologue: Setup code emitted at the start of a native block, typically to save
+  host registers or establish stack/frame state.
+- register allocation: Assigning guest registers or temporary values to host
+  registers so the native block can avoid repeated memory loads and stores.
+- runtime helper: Rust code called from emitted native code for operations that
+  need emulator services, such as memory access, atomics, CSRs, floating point,
+  syscalls, and traps.
+- RV64GC: The 64-bit RISC-V ISA profile targeted by this emulator, including
+  integer, multiplication/division, atomics, floating point, and compressed
+  instruction support.
+- RV64M: The RISC-V multiplication/division extension, including `mul`, `div`,
+  `rem`, and word-width variants.
+- self-modifying code: Guest code that writes to executable memory. RISCVM tracks
+  this with RAM code versions and block fingerprints.
+- side exit: A trace exit taken when a guard fails or a traced path needs to
+  leave the compiled trace. The native block flushes guest state and returns to
+  the dispatcher at the side-exit PC.
+- strict AOT: AOT mode with lazy compile misses disabled. Reaching an unknown PC
+  becomes an error instead of compiling new native code.
+- syscall: A guest request to the emulated operating-system interface, usually
+  reached through `ecall`.
+- tier: A compilation level with a different cost/performance tradeoff. RISCVM
+  currently has baseline, optimized, and trace tiers.
+- trace: A compiled path built from one observed run through conditional control
+  flow. It uses guards and side exits to preserve correctness when future runs
+  take a different path.
+- trace guard: A guard that checks a conditional branch still follows the traced
+  path.
+- trace loop guard: A guard for traced loops that either continues the loop on
+  the observed back edge or exits to the dispatcher.
+- trampoline: A small control-transfer helper. In this document it appears in
+  host-libc exit handling and guest return paths.
+
 ## Interpreter Mode
 
 The interpreter loop lives in `RV64GC::start()`:
