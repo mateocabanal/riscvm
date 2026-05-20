@@ -13,14 +13,14 @@ use crate::fcsr::round_f64;
 use crate::fcsr::RoundingMode;
 use crate::fcsr::FCSR;
 use crate::filesystem::{FileSystemError, GuestFileSystem};
-use crate::ram::MemoryRegion;
-use crate::ram::Ram;
+use crate::ram::{align_up, MemoryRegion, Ram, PAGE_SIZE};
 use crate::sign_extend;
 use crate::sign_extend12;
 use crate::syscalls::*;
 use crate::tracer::{ExecutionEngine, ExecutionTracer, TraceOptions};
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::fs;
 use std::ops::{Index, IndexMut};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -31,6 +31,15 @@ type Reg = u8;
 type Imm = u32;
 type Simm = i64;
 type Csr = u16;
+
+const DYNAMIC_LINKER_BASE: u64 = 0x1000_0000_0000;
+const RISCV_HWCAP_IMAFDC: usize = (1usize << ('I' as u8 - b'A'))
+    | (1usize << ('M' as u8 - b'A'))
+    | (1usize << ('A' as u8 - b'A'))
+    | (1usize << ('F' as u8 - b'A'))
+    | (1usize << ('D' as u8 - b'A'))
+    | (1usize << ('C' as u8 - b'A'));
+const SYNTHETIC_THREAD_DEFER_TICKS: u32 = 8;
 
 const CSR_FFLAGS: Csr = 0x001;
 const CSR_FRM: Csr = 0x002;
@@ -111,7 +120,7 @@ fn decode_standard_instruction(current_ins: u32) -> RV64GCInstruction {
         },
         0x0f => match current_ins {
             0x0000_100f => FenceI,
-            i if i & 0xf00f_ffff == 0x0000_000f => {
+            i if i & 0x000f_ffff == 0x0000_000f => {
                 Fence(i.bit_range(20..24) as u8, i.bit_range(24..28) as u8)
             }
             _ => IllegalInstruction(current_ins),
@@ -396,6 +405,8 @@ fn decode_float_op_instruction(
         0x61 => match rs2 {
             0 => Fcvtwd(rd, rm, rs1),
             1 => Fcvtwud(rd, rm, rs1),
+            2 => Fcvtld(rd, rm, rs1),
+            3 => Fcvtlud(rd, rm, rs1),
             _ => IllegalInstruction(current_ins),
         },
         0x68 => match rs2 {
@@ -408,6 +419,8 @@ fn decode_float_op_instruction(
         0x69 => match rs2 {
             0 => Fcvtdw(rd, rm, rs1),
             1 => Fcvtdwu(rd, rm, rs1),
+            2 => Fcvtdl(rd, rm, rs1),
+            3 => Fcvtdlu(rd, rm, rs1),
             _ => IllegalInstruction(current_ins),
         },
         0x70 => match (funct3, rs2) {
@@ -422,6 +435,10 @@ fn decode_float_op_instruction(
         },
         0x78 => match (funct3, rs2) {
             (0, 0) => Fmvwx(rd, rs1),
+            _ => IllegalInstruction(current_ins),
+        },
+        0x79 => match (funct3, rs2) {
+            (0, 0) => Fmvdx(rd, rs1),
             _ => IllegalInstruction(current_ins),
         },
         _ => IllegalInstruction(current_ins),
@@ -668,11 +685,51 @@ pub struct RV64GC {
     pub filesystem: GuestFileSystem,
     tracer: Option<ExecutionTracer>,
     pub should_quit: bool,
+    thread_id: u64,
+    synthetic_thread: bool,
+    synthetic_thread_yielded: bool,
+    clear_child_tid: Option<u64>,
+    synthetic_threads: Vec<RV64GC>,
+    synthetic_thread_defer: u32,
+    synthetic_thread_jit_options: Option<crate::jit::JitOptions>,
     executable_path: Option<PathBuf>,
+    linux_sysroot: Option<PathBuf>,
     argv: Vec<String>,
     elf_bin: Vec<u8>,
     decode_cache: Vec<Option<DecodedInstruction>>,
     jit_runtime_fault: Option<String>,
+}
+
+pub(crate) const RV64GC_RAM_OFFSET: usize = std::mem::offset_of!(RV64GC, ram);
+
+impl Clone for RV64GC {
+    fn clone(&self) -> Self {
+        Self {
+            registers: self.registers.clone(),
+            float_registers: self.float_registers.clone(),
+            fcsr: self.fcsr,
+            ram: self.ram.clone(),
+            filesystem: self.filesystem.clone(),
+            tracer: self
+                .tracer
+                .as_ref()
+                .map(|tracer| ExecutionTracer::new(tracer.options())),
+            should_quit: self.should_quit,
+            thread_id: self.thread_id,
+            synthetic_thread: self.synthetic_thread,
+            synthetic_thread_yielded: false,
+            clear_child_tid: self.clear_child_tid,
+            synthetic_threads: Vec::new(),
+            synthetic_thread_defer: 0,
+            synthetic_thread_jit_options: self.synthetic_thread_jit_options,
+            executable_path: self.executable_path.clone(),
+            linux_sysroot: self.linux_sysroot.clone(),
+            argv: self.argv.clone(),
+            elf_bin: self.elf_bin.clone(),
+            decode_cache: vec![None; DECODE_CACHE_SIZE],
+            jit_runtime_fault: None,
+        }
+    }
 }
 
 impl Default for RV64GC {
@@ -682,7 +739,12 @@ impl Default for RV64GC {
 }
 
 impl RV64GC {
-    fn initialize_stack_with_ext_lib(&mut self, elf: Elf, phdr_addr: Option<u64>) {
+    fn initialize_stack_with_ext_lib(
+        &mut self,
+        elf: Elf,
+        phdr_addr: Option<u64>,
+        interpreter_base: Option<u64>,
+    ) {
         use linux_libc_auxv::{AuxVar, AuxVarFlags, InitialLinuxLibcStackLayoutBuilder};
 
         let stack_top = 0x7FFF_FFFF_FFFF_FFF0;
@@ -700,22 +762,28 @@ impl RV64GC {
             builder.arg_v.push(arg);
         }
 
-        // let envp_vec = std::env::vars()
-        //     .map(|(k, v)| format!("{k}={v}"))
-        //     .collect::<Vec<String>>();
-        // for s in envp_vec.iter() {
-        //     builder.env_v.push(s);
-        // }
+        let envp_vec = [
+            "OMP_NUM_THREADS=1",
+            "OPENBLAS_NUM_THREADS=1",
+            "MKL_NUM_THREADS=1",
+            "NUMEXPR_NUM_THREADS=1",
+            "TBB_NUM_THREADS=1",
+        ];
+        for env in envp_vec {
+            builder.env_v.push(env);
+        }
 
         let mut rand_bytes = [0u8; 16];
         let mut rng = rand::thread_rng();
         rng.fill_bytes(&mut rand_bytes);
-        let auxv = [
+        let mut auxv = vec![
             AuxVar::Phdr(phdr_addr.unwrap() as *const u8),
             AuxVar::Phent(elf.header.e_phentsize.into()),
             AuxVar::Phnum(elf.header.e_phnum.into()),
             AuxVar::Pagesz(4096),
             AuxVar::Entry(elf.header.e_entry as *const u8),
+            AuxVar::HwCap(RISCV_HWCAP_IMAFDC),
+            AuxVar::Platform("riscv64"),
             AuxVar::Uid(1000),
             AuxVar::Gid(1000),
             AuxVar::EUid(1000),
@@ -726,6 +794,10 @@ impl RV64GC {
             AuxVar::Flags(AuxVarFlags::empty()),
             AuxVar::ExecFn(prog_name),
         ];
+
+        if let Some(base) = interpreter_base {
+            auxv.push(AuxVar::Base(base as *const u8));
+        }
 
         auxv.into_iter().for_each(|e| {
             builder.aux_v.insert(e);
@@ -760,7 +832,15 @@ impl RV64GC {
             tracer: None,
             fcsr: FCSR::new(),
             should_quit: false,
+            thread_id: std::process::id().into(),
+            synthetic_thread: false,
+            synthetic_thread_yielded: false,
+            clear_child_tid: None,
+            synthetic_threads: Vec::new(),
+            synthetic_thread_defer: 0,
+            synthetic_thread_jit_options: None,
             executable_path: None,
+            linux_sysroot: None,
             argv: Vec::new(),
             elf_bin: vec![],
             decode_cache: vec![None; DECODE_CACHE_SIZE],
@@ -779,6 +859,14 @@ impl RV64GC {
         self.filesystem.mount_host_directory(root)
     }
 
+    pub fn mount_host_directory_at(
+        &mut self,
+        guest_prefix: &str,
+        root: impl Into<std::path::PathBuf>,
+    ) -> Result<(), FileSystemError> {
+        self.filesystem.mount_host_directory_at(guest_prefix, root)
+    }
+
     pub fn stdout(&self) -> &[u8] {
         self.filesystem.stdout()
     }
@@ -793,6 +881,12 @@ impl RV64GC {
 
     pub fn trace_report(&self) -> Option<String> {
         self.tracer.as_ref().map(ExecutionTracer::report)
+    }
+
+    pub fn hot_jit_blocks(&self, limit: usize) -> Option<Vec<(u64, u64)>> {
+        self.tracer
+            .as_ref()
+            .map(|tracer| tracer.hot_jit_blocks(limit))
     }
 
     pub(crate) fn trace_start(&mut self, engine: ExecutionEngine) {
@@ -815,6 +909,87 @@ impl RV64GC {
         self.tracer.is_some()
     }
 
+    pub(crate) fn thread_id(&self) -> u64 {
+        self.thread_id
+    }
+
+    pub(crate) fn set_thread_id(&mut self, thread_id: u64) {
+        self.thread_id = thread_id;
+    }
+
+    pub(crate) fn is_synthetic_thread(&self) -> bool {
+        self.synthetic_thread
+    }
+
+    pub(crate) fn set_synthetic_thread(&mut self, synthetic_thread: bool) {
+        self.synthetic_thread = synthetic_thread;
+    }
+
+    pub(crate) fn prepare_synthetic_thread_run(&mut self) {
+        self.should_quit = false;
+        self.synthetic_thread_yielded = false;
+    }
+
+    pub(crate) fn yield_synthetic_thread(&mut self) {
+        self.synthetic_thread_yielded = true;
+        self.should_quit = true;
+    }
+
+    pub(crate) fn synthetic_thread_yielded(&self) -> bool {
+        self.synthetic_thread_yielded
+    }
+
+    pub(crate) fn clear_child_tid(&self) -> Option<u64> {
+        self.clear_child_tid
+    }
+
+    pub(crate) fn set_clear_child_tid(&mut self, clear_child_tid: Option<u64>) {
+        self.clear_child_tid = clear_child_tid;
+    }
+
+    pub(crate) fn enqueue_synthetic_thread(&mut self, thread: RV64GC) {
+        self.synthetic_threads.push(thread);
+        self.synthetic_thread_defer = self
+            .synthetic_thread_defer
+            .max(SYNTHETIC_THREAD_DEFER_TICKS);
+    }
+
+    pub(crate) fn take_synthetic_threads(&mut self) -> Vec<RV64GC> {
+        self.synthetic_thread_defer = 0;
+        std::mem::take(&mut self.synthetic_threads)
+    }
+
+    pub(crate) fn make_synthetic_threads_ready(&mut self) {
+        self.synthetic_thread_defer = 0;
+    }
+
+    pub(crate) fn tick_synthetic_threads(&mut self) {
+        if !self.synthetic_threads.is_empty() {
+            self.synthetic_thread_defer = self.synthetic_thread_defer.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn synthetic_threads_ready(&self) -> bool {
+        !self.synthetic_threads.is_empty() && self.synthetic_thread_defer == 0
+    }
+
+    pub(crate) fn merge_synthetic_thread_trace(&mut self, thread: &mut RV64GC) {
+        if let (Some(parent), Some(child)) = (self.tracer.as_mut(), thread.tracer.as_mut()) {
+            parent.merge_child(child);
+            *child = ExecutionTracer::new(child.options());
+        }
+    }
+
+    pub(crate) fn merge_synthetic_thread(&mut self, mut thread: RV64GC) {
+        self.merge_synthetic_thread_trace(&mut thread);
+        self.ram.copy_data_from(&thread.ram);
+        self.filesystem = thread.filesystem;
+    }
+
+    pub(crate) fn synthetic_thread_jit_options(&self) -> Option<crate::jit::JitOptions> {
+        self.synthetic_thread_jit_options
+    }
+
     pub(crate) fn set_jit_runtime_fault(&mut self, reason: impl Into<String>) {
         if self.jit_runtime_fault.is_none() {
             self.jit_runtime_fault = Some(reason.into());
@@ -828,6 +1003,10 @@ impl RV64GC {
 
     pub fn set_executable_path(&mut self, path: impl Into<PathBuf>) {
         self.executable_path = Some(path.into());
+    }
+
+    pub fn set_linux_sysroot(&mut self, path: impl Into<PathBuf>) {
+        self.linux_sysroot = Some(path.into());
     }
 
     pub fn set_argv<I, S>(&mut self, argv: I)
@@ -977,41 +1156,79 @@ impl RV64GC {
         let _guard = span.enter();
 
         let elf = goblin::elf::Elf::parse(&bin)?;
-        let entry = elf.entry;
-        self.registers[Pc] = entry;
-        let mut program_break_base = 0;
 
         if elf.header.e_machine != goblin::elf::header::EM_RISCV {
             return Err("Not a RISC-V ELF".into());
         }
 
+        let (ehdr, program_break_base) = self.load_elf_segments(&elf, &bin, 0)?;
+        let interpreter_base = self.load_program_interpreter(&elf)?;
+
+        if interpreter_base.is_none() {
+            self.apply_dynamic_relocations(&elf)?;
+        }
+
+        self.ram.set_program_break_base(program_break_base);
+        self.initialize_stack_with_ext_lib(elf, ehdr, interpreter_base);
+        self.elf_bin = bin;
+
+        trace!("mem regions: {}", self.ram);
+
+        Ok(())
+    }
+
+    fn load_elf_segments(
+        &mut self,
+        elf: &Elf<'_>,
+        bin: &[u8],
+        load_bias: u64,
+    ) -> Result<(Option<u64>, u64), Box<dyn std::error::Error>> {
         let mut ehdr = None;
+        let mut program_break_base = 0;
 
         for ph in &elf.program_headers {
             trace!("Reading ph of type: {:#08x}", ph.p_type);
             match ph.p_type {
                 goblin::elf::program_header::PT_LOAD => {
-                    let v_addr = ph.p_vaddr;
+                    let v_addr = load_bias.wrapping_add(ph.p_vaddr);
+                    let map_start = v_addr & !(PAGE_SIZE - 1);
+                    let page_offset = v_addr - map_start;
                     if ph.p_offset == 0 {
-                        // HACK: Is it guaranteed to start 64 bytes ahead??!!
                         ehdr = Some(v_addr + elf.header.e_phoff);
                     }
                     let mem_size = ph.p_memsz;
+                    let mapped_size = align_up(page_offset + mem_size, PAGE_SIZE);
                     program_break_base = program_break_base.max(v_addr + mem_size);
 
-                    let mut data = vec![0u8; mem_size as usize];
+                    let mut data = vec![0u8; mapped_size as usize];
+                    let file_map_start = ph
+                        .p_offset
+                        .checked_sub(page_offset)
+                        .ok_or("invalid ELF load segment alignment")?
+                        as usize;
+                    let file_map_len = page_offset
+                        .checked_add(ph.p_filesz)
+                        .ok_or("ELF load segment is too large")?
+                        as usize;
 
-                    for (i, byte) in bin[ph.file_range()].iter().enumerate() {
+                    for (i, byte) in bin[file_map_start..file_map_start + file_map_len]
+                        .iter()
+                        .enumerate()
+                    {
                         data[i] = *byte;
                     }
 
-                    let memory_region =
-                        MemoryRegion::new_with_flags(v_addr, mem_size, data, ph.p_flags.into());
+                    let memory_region = MemoryRegion::new_with_flags(
+                        map_start,
+                        mapped_size,
+                        data,
+                        ph.p_flags.into(),
+                    );
 
                     trace!(
                         "adding region, start: {}\t len: {}\toffset: {}",
-                        v_addr,
-                        mem_size,
+                        map_start,
+                        mapped_size,
                         ph.p_offset
                     );
                     self.ram.add_region(memory_region)?;
@@ -1021,14 +1238,33 @@ impl RV64GC {
             }
         }
 
-        self.apply_dynamic_relocations(&elf)?;
-        self.ram.set_program_break_base(program_break_base);
-        self.initialize_stack_with_ext_lib(elf, ehdr);
-        self.elf_bin = bin;
+        Ok((ehdr, program_break_base))
+    }
 
-        trace!("mem regions: {}", self.ram);
+    fn load_program_interpreter(
+        &mut self,
+        elf: &Elf<'_>,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let Some(interpreter) = elf.interpreter else {
+            self.registers[Pc] = elf.entry;
+            return Ok(None);
+        };
+        let Some(sysroot) = self.linux_sysroot.clone() else {
+            self.registers[Pc] = elf.entry;
+            return Ok(None);
+        };
 
-        Ok(())
+        let interpreter_path = interpreter.trim_start_matches('/');
+        let host_interpreter_path = sysroot.join(interpreter_path);
+        let interpreter_bin = fs::read(&host_interpreter_path)?;
+        let interpreter_elf = goblin::elf::Elf::parse(&interpreter_bin)?;
+        if interpreter_elf.header.e_machine != goblin::elf::header::EM_RISCV {
+            return Err("ELF interpreter is not a RISC-V ELF".into());
+        }
+
+        self.load_elf_segments(&interpreter_elf, &interpreter_bin, DYNAMIC_LINKER_BASE)?;
+        self.registers[Pc] = DYNAMIC_LINKER_BASE + interpreter_elf.entry;
+        Ok(Some(DYNAMIC_LINKER_BASE))
     }
 
     fn apply_dynamic_relocations(
@@ -1065,6 +1301,13 @@ impl RV64GC {
         self.ram = Ram::new();
         self.filesystem = GuestFileSystem::new();
         self.should_quit = false;
+        self.thread_id = std::process::id().into();
+        self.synthetic_thread = false;
+        self.synthetic_thread_yielded = false;
+        self.clear_child_tid = None;
+        self.synthetic_threads.clear();
+        self.synthetic_thread_defer = 0;
+        self.synthetic_thread_jit_options = None;
         self.jit_runtime_fault = None;
         self.clear_decode_cache();
 
@@ -1081,6 +1324,10 @@ impl RV64GC {
         // }
 
         while !self.should_quit {
+            if crate::debug::termination_requested() {
+                self.should_quit = true;
+                break;
+            }
             self.step();
         }
         self.trace_finish();
@@ -1095,7 +1342,25 @@ impl RV64GC {
         options: crate::jit::JitOptions,
     ) -> Result<(), crate::jit::JitError> {
         let mut jit = crate::jit::JitEngine::with_options(options)?;
-        jit.run(self)
+        let previous_thread_jit_options = self.synthetic_thread_jit_options.replace(options);
+        let result = jit.run(self);
+        self.synthetic_thread_jit_options = previous_thread_jit_options;
+        result
+    }
+
+    pub fn start_jit_with_options_and_profile<I>(
+        &mut self,
+        options: crate::jit::JitOptions,
+        startup_profile: I,
+    ) -> Result<(), crate::jit::JitError>
+    where
+        I: IntoIterator<Item = crate::jit::JitStartupProfileEntry>,
+    {
+        let mut jit = crate::jit::JitEngine::with_startup_profile(options, startup_profile)?;
+        let previous_thread_jit_options = self.synthetic_thread_jit_options.replace(options);
+        let result = jit.run(self);
+        self.synthetic_thread_jit_options = previous_thread_jit_options;
+        result
     }
 
     pub fn step(&mut self) {
@@ -1107,6 +1372,7 @@ impl RV64GC {
 
         self.execute();
         self.registers[Zero] = 0;
+        crate::syscalls::run_ready_synthetic_threads(self);
         assert_eq!(self.registers[Zero], 0);
     }
 
@@ -1172,6 +1438,12 @@ impl RV64GC {
         match syscall_id {
             17 => getcwd(self),
 
+            20 => epoll_create1(self),
+
+            21 => epoll_ctl(self),
+
+            22 => epoll_pwait(self),
+
             23 => dup(self),
 
             24 => dup3(self),
@@ -1185,6 +1457,8 @@ impl RV64GC {
             56 => openat(self),
 
             57 => close(self),
+
+            61 => getdents64(self),
 
             62 => lseek(self),
 
@@ -1220,11 +1494,7 @@ impl RV64GC {
                 self.should_quit = true;
             }
 
-            // NOTE: set_tid
-            96 => {
-                // PID
-                self.registers[A0] = 0;
-            }
+            96 => set_tid_address(self),
 
             98 => futex(self),
 
@@ -1234,6 +1504,12 @@ impl RV64GC {
             }
 
             113 => clock_gettime(self),
+
+            115 => clock_getres(self),
+
+            122 => sched_setaffinity(self),
+
+            123 => sched_getaffinity(self),
 
             131 => tgkill(self),
 
@@ -1252,10 +1528,13 @@ impl RV64GC {
             176 => getgid(self),
             177 => getegid(self),
             178 => gettid(self),
+            179 => sysinfo(self),
 
             214 => brk(self),
 
             215 => munmap(self),
+
+            220 => sys_clone(self),
 
             222 => mmap(self),
 
@@ -1270,6 +1549,8 @@ impl RV64GC {
             278 => getrandom(self),
 
             293 => rseq(self),
+
+            435 => clone3(self),
 
             // NOTE: Print i64
             1000 => {
@@ -1577,8 +1858,13 @@ pub enum RV64GCInstruction {
     Fcvtds(Reg, Reg, Reg),
     Fcvtwd(Reg, Reg, Reg),
     Fcvtwud(Reg, Reg, Reg),
+    Fcvtld(Reg, Reg, Reg),
+    Fcvtlud(Reg, Reg, Reg),
     Fcvtdwu(Reg, Reg, Reg),
     Fcvtdw(Reg, Reg, Reg),
+    Fcvtdl(Reg, Reg, Reg),
+    Fcvtdlu(Reg, Reg, Reg),
+    Fmvdx(Reg, Reg),
     Flw(Reg, Reg, Imm),
     Fsw(Reg, Reg, Imm),
     Fld(Reg, Reg, Imm),
@@ -2987,6 +3273,26 @@ impl RV64GCInstruction {
                 cpu.registers[rd] = sign_extend(u64::from(round_f64(value, rm) as u32), 32) as u64;
             }
 
+            Fcvtld(rd, rm, rs1) => {
+                let rm = if *rm == 0b111 {
+                    cpu.fcsr.frm
+                } else {
+                    RoundingMode::from(rm)
+                };
+                let value = f64::from_bits(cpu.float_registers[rs1]);
+                cpu.registers[rd] = round_f64(value, rm) as i64 as u64;
+            }
+
+            Fcvtlud(rd, rm, rs1) => {
+                let rm = if *rm == 0b111 {
+                    cpu.fcsr.frm
+                } else {
+                    RoundingMode::from(rm)
+                };
+                let value = f64::from_bits(cpu.float_registers[rs1]);
+                cpu.registers[rd] = round_f64(value, rm) as u64;
+            }
+
             Fcvtdw(rd, _, rs1) => {
                 cpu.float_registers[rd] = (cpu.registers[rs1] as i32 as f64).to_bits();
             }
@@ -2995,7 +3301,29 @@ impl RV64GCInstruction {
                 cpu.float_registers[rd] = (cpu.registers[rs1] as u32 as f64).to_bits();
             }
 
+            Fcvtdl(rd, rm, rs1) => {
+                let rm = if *rm == 0b111 {
+                    cpu.fcsr.frm
+                } else {
+                    RoundingMode::from(rm)
+                };
+                let value = cpu.registers[rs1] as i64 as f64;
+                cpu.float_registers[rd] = round_f64(value, rm).to_bits();
+            }
+
+            Fcvtdlu(rd, rm, rs1) => {
+                let rm = if *rm == 0b111 {
+                    cpu.fcsr.frm
+                } else {
+                    RoundingMode::from(rm)
+                };
+                let value = cpu.registers[rs1] as f64;
+                cpu.float_registers[rd] = round_f64(value, rm).to_bits();
+            }
+
             Fmvxd(rd, rs1) => cpu.registers[rd] = cpu.float_registers[rs1],
+
+            Fmvdx(rd, rs1) => cpu.float_registers[rd] = cpu.registers[rs1],
 
             Fsgnjd(rd, rs1, rs2) => {
                 let sign_bit = cpu.float_registers[rs2] & 0x8000000000000000;
@@ -3328,7 +3656,7 @@ impl Display for RV64GCInstruction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RV64GCRegisters {
     registers: [u64; 33],
 }
@@ -3409,7 +3737,7 @@ impl RV64GCRegisters {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RV64GCFloatRegisters {
     registers: [u64; 32],
 }

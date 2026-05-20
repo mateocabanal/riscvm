@@ -1,5 +1,6 @@
 pub mod cpu;
 pub mod csr;
+pub mod debug;
 pub mod exception;
 pub mod fcsr;
 pub mod filesystem;

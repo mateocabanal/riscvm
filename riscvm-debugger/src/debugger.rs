@@ -8,6 +8,8 @@ use crate::reverse::{
     ReverseOutputStyle,
 };
 use riscvm_core::cpu::{RV64GCRegAbiName, RV64GC};
+use riscvm_core::jit::{JitExecutionMode, JitOptions};
+use riscvm_core::tracer::TraceOptions;
 
 const PC_REGISTER: usize = 32;
 
@@ -150,6 +152,8 @@ pub struct Debugger {
     watchpoints: Vec<Watchpoint>,
     next_watchpoint_id: usize,
     mount_root: Option<PathBuf>,
+    executable_dir: Option<PathBuf>,
+    linux_sysroot: Option<PathBuf>,
     last_stop: Option<StopReason>,
 }
 
@@ -161,14 +165,29 @@ impl Debugger {
             watchpoints: Vec::new(),
             next_watchpoint_id: 1,
             mount_root: None,
+            executable_dir: None,
+            linux_sysroot: None,
             last_stop: None,
         }
     }
 
-    pub fn load(path: &str, guest_args: Vec<String>) -> io::Result<Self> {
+    pub fn load(path: &str, guest_args: Vec<String>, sysroot: Option<String>) -> io::Result<Self> {
         let executable_path = absolute_executable_path(path);
         let mut cpu = RV64GC::new();
         let mount_root = std::env::current_dir()?;
+        let executable_dir = executable_path.parent().map(PathBuf::from);
+        let linux_sysroot = sysroot.map(PathBuf::from);
+
+        if let Some(executable_dir) = executable_dir.as_ref() {
+            let guest_prefix = executable_dir.to_string_lossy();
+            cpu.mount_host_directory_at(&guest_prefix, executable_dir)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
+        }
+        if let Some(sysroot) = linux_sysroot.as_ref() {
+            cpu.set_linux_sysroot(sysroot);
+            cpu.mount_host_directory(sysroot)
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
+        }
         cpu.mount_host_directory(&mount_root)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
         cpu.set_executable_path(&executable_path);
@@ -188,6 +207,8 @@ impl Debugger {
 
         let mut debugger = Self::from_cpu(cpu);
         debugger.mount_root = Some(mount_root);
+        debugger.executable_dir = executable_dir;
+        debugger.linux_sysroot = linux_sysroot;
         Ok(debugger)
     }
 
@@ -321,12 +342,26 @@ impl Debugger {
             "disasm" | "disassemble" | "u" => self.command_disassemble(&tokens),
             "decompile" | "reverse" | "rc" => self.command_reverse_compile(&tokens),
             "watch" | "w" => self.command_watch(&tokens),
+            "jit" => self.command_jit(&tokens),
+            "profile" => self.command_profile(),
             _ => CommandOutput::message(format!("unknown command: {}", tokens[0])),
         }
     }
 
     fn reset(&mut self) -> Result<(), String> {
         self.cpu.reset();
+        if let Some(executable_dir) = &self.executable_dir {
+            let guest_prefix = executable_dir.to_string_lossy();
+            self.cpu
+                .mount_host_directory_at(&guest_prefix, executable_dir)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        if let Some(sysroot) = &self.linux_sysroot {
+            self.cpu.set_linux_sysroot(sysroot);
+            self.cpu
+                .mount_host_directory(sysroot)
+                .map_err(|error| format!("{error:?}"))?;
+        }
         if let Some(root) = &self.mount_root {
             self.cpu
                 .mount_host_directory(root)
@@ -795,6 +830,103 @@ impl Debugger {
         }
     }
 
+    fn command_jit(&mut self, tokens: &[&str]) -> CommandOutput {
+        let Some(mode) = tokens.get(1).copied() else {
+            return CommandOutput::message(
+                "jit requires an engine: jit run <hybrid|jit|aot> [profile] [top N] [interval N]",
+            );
+        };
+        if mode != "run" {
+            return CommandOutput::message(format!("unknown jit operation: {mode}"));
+        }
+
+        let Some(engine) = tokens.get(2).copied() else {
+            return CommandOutput::message("jit run requires hybrid, jit, or aot");
+        };
+        let execution_mode = match engine {
+            "hybrid" => JitExecutionMode::Hybrid,
+            "jit" => JitExecutionMode::Jit,
+            "aot" => JitExecutionMode::Aot,
+            _ => return CommandOutput::message(format!("unknown jit engine: {engine}")),
+        };
+
+        let mut profile = false;
+        let mut top_limit = TraceOptions::default().top_limit;
+        let mut profile_interval = None;
+        let mut idx = 3;
+        while idx < tokens.len() {
+            match tokens[idx] {
+                "profile" => {
+                    profile = true;
+                    idx += 1;
+                }
+                "top" => {
+                    let Some(value) = tokens.get(idx + 1) else {
+                        return CommandOutput::message("jit run top requires a count");
+                    };
+                    top_limit = match parse_usize(value) {
+                        Ok(value) => value,
+                        Err(error) => return CommandOutput::message(error),
+                    };
+                    profile = true;
+                    idx += 2;
+                }
+                "interval" => {
+                    let Some(value) = tokens.get(idx + 1) else {
+                        return CommandOutput::message("jit run interval requires a count");
+                    };
+                    profile_interval = match parse_u64(value) {
+                        Ok(value) => Some(value.max(1)),
+                        Err(error) => return CommandOutput::message(error),
+                    };
+                    profile = true;
+                    idx += 2;
+                }
+                other => return CommandOutput::message(format!("unknown jit run option: {other}")),
+            }
+        }
+
+        if profile {
+            self.cpu.set_trace_options(TraceOptions {
+                profile: true,
+                top_limit,
+                profile_interval,
+                ..TraceOptions::default()
+            });
+        }
+
+        let mut options = JitOptions {
+            execution_mode,
+            ..JitOptions::default()
+        };
+        if self.linux_sysroot.is_some() {
+            options.host_libc_plt_stdio = false;
+        }
+
+        match self.cpu.start_jit_with_options(options) {
+            Ok(()) => {
+                let stop = StopReason::Exited { pc: self.pc() };
+                self.last_stop = Some(stop.clone());
+                let mut message = format!("jit {engine} completed: {}", stop.message());
+                if profile {
+                    if let Some(report) = self.cpu.trace_report() {
+                        message.push('\n');
+                        message.push_str(&report);
+                    }
+                }
+                CommandOutput::message(message)
+            }
+            Err(error) => CommandOutput::message(format!("jit {engine} failed: {error}")),
+        }
+    }
+
+    fn command_profile(&self) -> CommandOutput {
+        match self.cpu.trace_report() {
+            Some(report) => CommandOutput::message(report),
+            None => CommandOutput::message("profiling is not enabled"),
+        }
+    }
+
     fn add_watchpoint(&mut self, target: WatchTarget) -> CommandOutput {
         let last_value = match self.read_watch_target(&target) {
             Ok(value) => value,
@@ -969,8 +1101,12 @@ pub fn absolute_executable_path(path: &str) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/").join(path))
 }
 
-pub fn load_debugger_from_path(path: &str, guest_args: Vec<String>) -> io::Result<Debugger> {
-    Debugger::load(path, guest_args)
+pub fn load_debugger_from_path(
+    path: &str,
+    guest_args: Vec<String>,
+    sysroot: Option<String>,
+) -> io::Result<Debugger> {
+    Debugger::load(path, guest_args, sysroot)
 }
 
 fn instruction_len(opcode: u32) -> u64 {
@@ -1147,6 +1283,9 @@ fn help_text() -> &'static str {
   decompile c [addr] [count] emit C-style output with declarations
   decompile all [limit]      reverse compile executable regions
   decompile c all [limit]    reverse compile executable regions as C
+  jit run <hybrid|jit|aot> [profile] [top N] [interval N]
+                             run a JIT-family engine and optionally print a profile
+  profile                    print the current trace/profile report
   status | reset | quit"
 }
 

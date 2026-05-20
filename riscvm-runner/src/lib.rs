@@ -1,19 +1,15 @@
 use std::{io::Read, path::PathBuf};
 
 use riscvm_core::cpu::RV64GC;
-use riscvm_core::jit::{JitExecutionMode, JitOptions};
+use riscvm_core::debug::{self, DebugWriter};
+use riscvm_core::jit::{
+    format_startup_profile, parse_startup_profile, JitExecutionMode, JitOptions,
+    JitStartupProfileEntry,
+};
 use riscvm_core::tracer::TraceOptions;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::EnvFilter;
 
 pub fn run_from_env() {
-    tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::INFO)
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_ansi(true)
-        .without_time()
-        .init();
-
     run(std::env::args().skip(1));
 }
 
@@ -63,6 +59,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     let mut jit_dump = false;
     let default_jit_options = JitOptions::default();
     let mut jit_host_libc = default_jit_options.host_libc;
+    let mut jit_host_libc_plt_stdio = default_jit_options.host_libc_plt_stdio;
     let mut jit_libc_start_main_shortcut = default_jit_options.libc_start_main_shortcut;
     let mut jit_dynamic_recompilation = default_jit_options.dynamic_recompilation;
     let mut jit_trace_compilation = default_jit_options.trace_compilation;
@@ -79,6 +76,15 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     let mut aot_symbol_entries = default_jit_options.aot_symbol_entries;
     let mut aot_linear_sweep = default_jit_options.aot_linear_sweep;
     let mut trace_options = TraceOptions::default();
+    let mut print_profile = false;
+    let mut jit_startup_profile_path: Option<PathBuf> = None;
+    let mut jit_startup_profile_limit = 32usize;
+    let mut jit_profile_out_path: Option<PathBuf> = None;
+    let mut jit_profile_out_limit = 64usize;
+    let mut linux_sysroot = std::env::var_os("RISCVM_SYSROOT").map(PathBuf::from);
+    let mut debug_file_path = std::env::var_os("RISCVM_DEBUG_FILE").map(PathBuf::from);
+    let mut verbosity = 0u8;
+    let mut quiet = false;
     let mut file_path = None;
     let mut guest_args = Vec::new();
     let mut args = args.into_iter();
@@ -105,6 +111,31 @@ pub fn run(args: impl IntoIterator<Item = String>) {
             "--aot" => {
                 engine_mode = RunnerEngineMode::Aot;
                 engine_mode_explicit = true;
+            }
+            "--debug" => {
+                verbosity = verbosity.max(1);
+                jit_log = true;
+                trace_options.profile = true;
+                print_profile = true;
+            }
+            "-v" | "--verbose" => {
+                verbosity = verbosity.saturating_add(1);
+            }
+            "--quiet" => {
+                quiet = true;
+            }
+            "--debug-file" | "--debug-out" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{arg} requires a path");
+                    std::process::exit(2);
+                };
+                debug_file_path = Some(PathBuf::from(value));
+            }
+            arg if arg.starts_with("--debug-file=") => {
+                debug_file_path = Some(PathBuf::from(arg.trim_start_matches("--debug-file=")));
+            }
+            arg if arg.starts_with("--debug-out=") => {
+                debug_file_path = Some(PathBuf::from(arg.trim_start_matches("--debug-out=")));
             }
             "--jit-log" => {
                 activate_jit_flag(&mut engine_mode, engine_mode_explicit);
@@ -265,7 +296,70 @@ pub fn run(args: impl IntoIterator<Item = String>) {
                 jit_compile_queue_limit = parse_usize_flag("--jit-compile-queue-limit", value);
             }
             "--trace" => trace_options.trace = true,
-            "--profile" => trace_options.profile = true,
+            "--profile" => {
+                trace_options.profile = true;
+                print_profile = true;
+            }
+            "--jit-profile" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--jit-profile requires a path");
+                    std::process::exit(2);
+                };
+                activate_jit_flag(&mut engine_mode, engine_mode_explicit);
+                jit_startup_profile_path = Some(PathBuf::from(value));
+            }
+            arg if arg.starts_with("--jit-profile=") => {
+                activate_jit_flag(&mut engine_mode, engine_mode_explicit);
+                jit_startup_profile_path =
+                    Some(PathBuf::from(arg.trim_start_matches("--jit-profile=")));
+            }
+            "--jit-profile-limit" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--jit-profile-limit requires a value");
+                    std::process::exit(2);
+                };
+                jit_startup_profile_limit = parse_usize_flag("--jit-profile-limit", &value);
+            }
+            arg if arg.starts_with("--jit-profile-limit=") => {
+                let value = arg.trim_start_matches("--jit-profile-limit=");
+                jit_startup_profile_limit = parse_usize_flag("--jit-profile-limit", value);
+            }
+            "--jit-profile-out" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--jit-profile-out requires a path");
+                    std::process::exit(2);
+                };
+                activate_jit_flag(&mut engine_mode, engine_mode_explicit);
+                trace_options.profile = true;
+                jit_profile_out_path = Some(PathBuf::from(value));
+            }
+            arg if arg.starts_with("--jit-profile-out=") => {
+                activate_jit_flag(&mut engine_mode, engine_mode_explicit);
+                trace_options.profile = true;
+                jit_profile_out_path =
+                    Some(PathBuf::from(arg.trim_start_matches("--jit-profile-out=")));
+            }
+            "--jit-profile-out-limit" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--jit-profile-out-limit requires a value");
+                    std::process::exit(2);
+                };
+                jit_profile_out_limit = parse_usize_flag("--jit-profile-out-limit", &value);
+            }
+            arg if arg.starts_with("--jit-profile-out-limit=") => {
+                let value = arg.trim_start_matches("--jit-profile-out-limit=");
+                jit_profile_out_limit = parse_usize_flag("--jit-profile-out-limit", value);
+            }
+            "--sysroot" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--sysroot requires a path");
+                    std::process::exit(2);
+                };
+                linux_sysroot = Some(PathBuf::from(value));
+            }
+            arg if arg.starts_with("--sysroot=") => {
+                linux_sysroot = Some(PathBuf::from(arg.trim_start_matches("--sysroot=")));
+            }
             "--profile-top" => {
                 let Some(value) = args.next() else {
                     eprintln!("--profile-top requires a value");
@@ -276,6 +370,21 @@ pub fn run(args: impl IntoIterator<Item = String>) {
             arg if arg.starts_with("--profile-top=") => {
                 let value = arg.trim_start_matches("--profile-top=");
                 trace_options.top_limit = parse_usize_flag("--profile-top", value);
+            }
+            "--profile-interval" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--profile-interval requires a value");
+                    std::process::exit(2);
+                };
+                trace_options.profile = true;
+                trace_options.profile_interval =
+                    Some(parse_u64_flag("--profile-interval", &value).max(1));
+            }
+            arg if arg.starts_with("--profile-interval=") => {
+                let value = arg.trim_start_matches("--profile-interval=");
+                trace_options.profile = true;
+                trace_options.profile_interval =
+                    Some(parse_u64_flag("--profile-interval", value).max(1));
             }
             "--trace-limit" => {
                 let Some(value) = args.next() else {
@@ -306,8 +415,11 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         print_usage();
         return;
     };
+    init_debugging(debug_file_path.as_ref(), verbosity, quiet);
     let executable_path = absolute_executable_path(&file_path);
     let executable_argv0 = executable_path.to_string_lossy().into_owned();
+    let startup_profile =
+        load_startup_profile(jit_startup_profile_path.as_ref(), jit_startup_profile_limit);
 
     let mut bin = Vec::new();
     std::fs::File::open(&file_path)
@@ -317,12 +429,36 @@ pub fn run(args: impl IntoIterator<Item = String>) {
 
     let mut riscvm = RV64GC::new();
     riscvm.set_executable_path(&executable_path);
+    if let Some(executable_dir) = executable_path.parent() {
+        let guest_prefix = executable_dir.to_string_lossy();
+        riscvm
+            .mount_host_directory_at(&guest_prefix, executable_dir)
+            .unwrap();
+    }
+    if let Some(sysroot) = linux_sysroot.as_ref() {
+        jit_host_libc_plt_stdio = false;
+        riscvm.set_linux_sysroot(sysroot);
+        riscvm.mount_host_directory(sysroot).unwrap();
+    }
     let mut argv = vec![executable_argv0];
     argv.extend(guest_args);
+    let debug_argv = argv.join(" ");
     riscvm.set_argv(argv);
     riscvm
         .mount_host_directory(std::env::current_dir().unwrap())
         .unwrap();
+
+    if debug_file_path.is_some() || verbosity > 0 {
+        debug::line(format_args!(
+            "[runner] engine={engine_mode:?} binary={} sysroot={} guest_args={}",
+            executable_path.display(),
+            linux_sysroot
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            debug_argv
+        ));
+    }
 
     if file_path.ends_with(".bin") {
         riscvm.load_bin(bin);
@@ -338,6 +474,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         let jit_options = JitOptions {
             execution_mode,
             host_libc: jit_host_libc,
+            host_libc_plt_stdio: jit_host_libc_plt_stdio && jit_host_libc,
             libc_start_main_shortcut: jit_libc_start_main_shortcut,
             debug_log: jit_log,
             dump_instructions: jit_dump,
@@ -354,7 +491,8 @@ pub fn run(args: impl IntoIterator<Item = String>) {
             aot_symbol_entries,
             aot_linear_sweep,
         };
-        if let Err(error) = riscvm.start_jit_with_options(jit_options) {
+        if let Err(error) = riscvm.start_jit_with_options_and_profile(jit_options, startup_profile)
+        {
             eprintln!("{execution_mode:?} engine failed: {error}");
             std::process::exit(1);
         }
@@ -362,11 +500,29 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         riscvm.start();
     }
 
-    if trace_options.profile {
-        if let Some(report) = riscvm.trace_report() {
-            eprint!("{report}");
+    if let Some(path) = jit_profile_out_path {
+        if let Err(error) = write_startup_profile(&riscvm, jit_profile_out_limit, &path) {
+            eprintln!("failed to write JIT profile {}: {error}", path.display());
+            std::process::exit(1);
         }
     }
+
+    if print_profile {
+        if let Some(report) = riscvm.trace_report() {
+            debug::write(format_args!("{report}"));
+        }
+    }
+
+    if let Some(signal) = debug::termination_signal() {
+        debug::line(format_args!(
+            "[signal] received {} ({signal}); flushed debug output before exit",
+            debug::signal_name(signal)
+        ));
+        debug::flush();
+        std::process::exit(128 + signal);
+    }
+
+    debug::flush();
 }
 
 fn print_usage() {
@@ -377,8 +533,64 @@ fn print_usage() {
         RunnerEngineMode::Aot => "--aot",
     };
     eprintln!(
-        "Usage: riscvm [--hybrid|--jit|--aot|--interp] [--jit-log] [--jit-dump] [--jit-host-libc] [--jit-no-host-libc] [--jit-libc-start-main-shortcut] [--jit-no-libc-start-main-shortcut] [--jit-dynarec] [--jit-no-dynarec] [--jit-trace] [--jit-no-trace] [--jit-hot-threshold N] [--jit-no-tier-budget] [--aot-linear-sweep] [--aot-no-linear-sweep] [--aot-compile-misses] [--aot-no-compile-misses] [--aot-symbol-entries] [--aot-no-symbol-entries] [--jit-non-loop-hot-multiplier N] [--jit-min-optimized-block-instructions N] [--jit-bg-compile] [--jit-compiler-threads N] [--jit-compile-queue-limit N] [--trace] [--trace-limit N] [--profile] [--profile-top N] <binary> [guest-args...]\nDefault engine: {default_engine}"
+        "Usage: riscvm [--hybrid|--jit|--aot|--interp] [--sysroot PATH] [--debug] [-v|--verbose] [--quiet] [--debug-file PATH] [--jit-log] [--jit-dump] [--jit-host-libc] [--jit-no-host-libc] [--jit-libc-start-main-shortcut] [--jit-no-libc-start-main-shortcut] [--jit-dynarec] [--jit-no-dynarec] [--jit-trace] [--jit-no-trace] [--jit-hot-threshold N] [--jit-no-tier-budget] [--aot-linear-sweep] [--aot-no-linear-sweep] [--aot-compile-misses] [--aot-no-compile-misses] [--aot-symbol-entries] [--aot-no-symbol-entries] [--jit-non-loop-hot-multiplier N] [--jit-min-optimized-block-instructions N] [--jit-bg-compile] [--jit-compiler-threads N] [--jit-compile-queue-limit N] [--jit-profile PATH] [--jit-profile-limit N] [--jit-profile-out PATH] [--jit-profile-out-limit N] [--trace] [--trace-limit N] [--profile] [--profile-top N] [--profile-interval N] <binary> [guest-args...]\nDefault engine: {default_engine}"
     );
+}
+
+fn init_debugging(debug_file_path: Option<&PathBuf>, verbosity: u8, quiet: bool) {
+    if let Some(path) = debug_file_path {
+        if let Err(error) = debug::init_debug_file(path) {
+            eprintln!("failed to open debug file {}: {error}", path.display());
+            std::process::exit(2);
+        }
+    }
+    if let Err(error) = debug::install_signal_handlers() {
+        eprintln!("failed to install signal handlers: {error}");
+    }
+
+    let default_filter = if quiet {
+        "error"
+    } else {
+        match verbosity {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(debug_file_path.is_none())
+        .without_time()
+        .with_writer(|| DebugWriter)
+        .try_init();
+}
+
+fn load_startup_profile(path: Option<&PathBuf>, limit: usize) -> Vec<JitStartupProfileEntry> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        eprintln!("failed to read JIT profile {}: {error}", path.display());
+        std::process::exit(2);
+    });
+    let mut profile = parse_startup_profile(&text).unwrap_or_else(|error| {
+        eprintln!("failed to parse JIT profile {}: {error}", path.display());
+        std::process::exit(2);
+    });
+    profile.truncate(limit);
+    profile
+}
+
+fn write_startup_profile(riscvm: &RV64GC, limit: usize, path: &PathBuf) -> std::io::Result<()> {
+    let entries: Vec<_> = riscvm
+        .hot_jit_blocks(limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pc, count)| JitStartupProfileEntry::new(pc, count))
+        .collect();
+    std::fs::write(path, format_startup_profile(&entries))
 }
 
 fn parse_usize_flag(flag: &str, value: &str) -> usize {

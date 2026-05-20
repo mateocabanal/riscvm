@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cpu::RV64GCRegAbiName::*;
@@ -25,6 +26,7 @@ enum Errno {
     EACCES = 13,
     EFAULT = 14,
     EEXIST = 17,
+    ENOTDIR = 20,
     EISDIR = 21,
     EINVAL = 22,
     EMFILE = 24,
@@ -53,8 +55,29 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const UTS_FIELD_LEN: u64 = 65;
 const IOV_MAX: u64 = 1024;
 const O_CLOEXEC: u64 = 0o2000000;
+const PROT_EXEC: i64 = 0x4;
 const MAP_FIXED: i64 = 0x10;
 const MAP_ANONYMOUS: i64 = 0x20;
+const EMULATED_CPU_COUNT: u64 = 1;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+const FIRST_SYNTHETIC_TID: u64 = 10_000;
+const CLONE_ARGS_FLAGS_OFFSET: u64 = 0;
+const CLONE_ARGS_CHILD_TID_OFFSET: u64 = 16;
+const CLONE_ARGS_PARENT_TID_OFFSET: u64 = 24;
+const CLONE_ARGS_STACK_OFFSET: u64 = 40;
+const CLONE_ARGS_STACK_SIZE_OFFSET: u64 = 48;
+const CLONE_ARGS_TLS_OFFSET: u64 = 56;
+
+static NEXT_SYNTHETIC_TID: AtomicU64 = AtomicU64::new(FIRST_SYNTHETIC_TID);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticThreadRun {
+    Completed,
+    Yielded,
+}
 
 fn read_c_string(cpu: &RV64GC, ptr: u64) -> Result<String, Errno> {
     let mut bytes = Vec::new();
@@ -70,6 +93,14 @@ fn read_c_string(cpu: &RV64GC, ptr: u64) -> Result<String, Errno> {
 }
 
 fn write_bytes(cpu: &mut RV64GC, ptr: u64, bytes: &[u8]) -> Result<(), Errno> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if let Ok(target) = cpu.ram.write_slice_range(ptr, bytes.len() as u64) {
+        target.copy_from_slice(bytes);
+        return Ok(());
+    }
+
     for (idx, byte) in bytes.iter().enumerate() {
         let addr = ptr.checked_add(idx as u64).ok_or(Errno::EFAULT)?;
         cpu.ram.write_byte(addr, *byte).map_err(|_| Errno::EFAULT)?;
@@ -89,6 +120,13 @@ fn write_c_string(cpu: &mut RV64GC, ptr: u64, value: &str) -> Result<usize, Errn
 
 fn read_bytes(cpu: &RV64GC, ptr: u64, len: u64) -> Result<Vec<u8>, Errno> {
     let len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if let Ok(slice) = cpu.ram.read_slice_range(ptr, len as u64) {
+        return Ok(slice.to_vec());
+    }
+
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
 
@@ -102,6 +140,10 @@ fn read_bytes(cpu: &RV64GC, ptr: u64, len: u64) -> Result<Vec<u8>, Errno> {
 
 fn validate_guest_buffer(cpu: &RV64GC, ptr: u64, len: u64) -> Result<(), Errno> {
     let len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+    if len == 0 || cpu.ram.read_slice_range(ptr, len as u64).is_ok() {
+        return Ok(());
+    }
+
     for idx in 0..len {
         let addr = ptr.checked_add(idx as u64).ok_or(Errno::EFAULT)?;
         cpu.ram.read_byte(addr).map_err(|_| Errno::EFAULT)?;
@@ -170,6 +212,121 @@ fn read_iovecs(cpu: &RV64GC, iovec_ptr: u64, iovec_cnt: u64) -> Result<Vec<(u64,
     Ok(iovecs)
 }
 
+fn write_guest_tid(cpu: &mut RV64GC, ptr: u64, tid: u64) -> Result<(), Errno> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    cpu.ram
+        .write_word(ptr, tid as u32)
+        .map_err(|_| Errno::EFAULT)
+}
+
+fn read_clone_arg(cpu: &RV64GC, args: u64, size: u64, offset: u64) -> Result<u64, Errno> {
+    if args == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if size < offset + 8 {
+        return Ok(0);
+    }
+
+    cpu.ram
+        .read_doubleword(args + offset)
+        .map_err(|_| Errno::EFAULT)
+}
+
+fn enqueue_synthetic_clone(
+    cpu: &mut RV64GC,
+    flags: u64,
+    stack: u64,
+    parent_tid: u64,
+    tls: u64,
+    child_tid: u64,
+) -> Result<u64, Errno> {
+    if flags & CLONE_VM == 0 {
+        warn!("clone without CLONE_VM is not supported: flags=0x{flags:x}");
+        return Err(Errno::ENOSYS);
+    }
+
+    let tid = NEXT_SYNTHETIC_TID.fetch_add(1, Ordering::Relaxed);
+    if flags & CLONE_PARENT_SETTID != 0 {
+        write_guest_tid(cpu, parent_tid, tid)?;
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        write_guest_tid(cpu, child_tid, tid)?;
+    }
+
+    let mut child = cpu.clone();
+    child.set_thread_id(tid);
+    child.set_synthetic_thread(true);
+    child.should_quit = false;
+    child.registers[A0] = 0;
+    child.registers[Pc] = child.registers[Pc].wrapping_add(4);
+    if stack != 0 {
+        child.registers[Sp] = stack;
+    }
+    if tls != 0 {
+        child.registers[Tp] = tls;
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        write_guest_tid(&mut child, child_tid, tid)?;
+    }
+    child.set_clear_child_tid((flags & CLONE_CHILD_CLEARTID != 0).then_some(child_tid));
+
+    cpu.enqueue_synthetic_thread(child);
+    Ok(tid)
+}
+
+fn run_synthetic_thread(child: &mut RV64GC) -> Result<SyntheticThreadRun, Errno> {
+    child.prepare_synthetic_thread_run();
+    if let Some(options) = child.synthetic_thread_jit_options() {
+        child.start_jit_with_options(options).map_err(|error| {
+            child.set_jit_runtime_fault(format!("synthetic clone thread JIT failed: {error}"));
+            Errno::EFAULT
+        })?;
+    } else {
+        child.start();
+    }
+    run_pending_synthetic_threads(child)?;
+    if child.synthetic_thread_yielded() {
+        return Ok(SyntheticThreadRun::Yielded);
+    }
+    if let Some(clear_child_tid) = child.clear_child_tid() {
+        write_guest_tid(child, clear_child_tid, 0)?;
+    }
+
+    Ok(SyntheticThreadRun::Completed)
+}
+
+fn run_pending_synthetic_threads(cpu: &mut RV64GC) -> Result<(), Errno> {
+    let mut yielded_threads = Vec::new();
+    for mut child in cpu.take_synthetic_threads() {
+        match run_synthetic_thread(&mut child)? {
+            SyntheticThreadRun::Completed => cpu.merge_synthetic_thread(child),
+            SyntheticThreadRun::Yielded => {
+                cpu.merge_synthetic_thread_trace(&mut child);
+                yielded_threads.push(child);
+            }
+        }
+    }
+    for child in yielded_threads {
+        cpu.enqueue_synthetic_thread(child);
+    }
+    Ok(())
+}
+
+pub(crate) fn run_ready_synthetic_threads(cpu: &mut RV64GC) {
+    cpu.tick_synthetic_threads();
+    if !cpu.synthetic_threads_ready() {
+        return;
+    }
+    if let Err(errno) = run_pending_synthetic_threads(cpu) {
+        let result = errno.into_err();
+        cpu.set_jit_runtime_fault(format!(
+            "synthetic clone thread scheduler failed with result {result}"
+        ));
+    }
+}
+
 fn write_stat(cpu: &mut RV64GC, statbuf: u64, metadata: FileMetadata) -> Result<(), Errno> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -178,8 +335,8 @@ fn write_stat(cpu: &mut RV64GC, statbuf: u64, metadata: FileMetadata) -> Result<
     let nsec = u64::from(now.subsec_nanos());
 
     cpu.ram
-        .write_doubleword(statbuf, 0)
-        .and_then(|_| cpu.ram.write_doubleword(statbuf + 8, 1))
+        .write_doubleword(statbuf, metadata.dev)
+        .and_then(|_| cpu.ram.write_doubleword(statbuf + 8, metadata.ino))
         .and_then(|_| cpu.ram.write_word(statbuf + 16, metadata.mode))
         .and_then(|_| cpu.ram.write_word(statbuf + 20, 1))
         .and_then(|_| cpu.ram.write_word(statbuf + 24, 1000))
@@ -260,6 +417,52 @@ pub fn dup3(cpu: &mut RV64GC) {
     }
 }
 
+// 20
+pub fn epoll_create1(cpu: &mut RV64GC) {
+    let flags = cpu.registers[A0];
+    if flags & !O_CLOEXEC != 0 {
+        cpu.registers[A0] = Errno::EINVAL.into_err();
+        return;
+    }
+
+    cpu.registers[A0] = Errno::ENOSYS.into_err();
+}
+
+// 21
+pub fn epoll_ctl(cpu: &mut RV64GC) {
+    let _epfd = cpu.registers[A0];
+    let _op = cpu.registers[A1];
+    let _fd = cpu.registers[A2];
+    let event = cpu.registers[A3];
+    if event != 0 && validate_guest_buffer(cpu, event, 16).is_err() {
+        cpu.registers[A0] = Errno::EFAULT.into_err();
+        return;
+    }
+
+    cpu.registers[A0] = 0;
+}
+
+// 22
+pub fn epoll_pwait(cpu: &mut RV64GC) {
+    let _epfd = cpu.registers[A0];
+    let events = cpu.registers[A1];
+    let maxevents = cpu.registers[A2] as i64;
+    let _timeout = cpu.registers[A3] as i64;
+    let _sigmask = cpu.registers[A4];
+    let _sigsetsize = cpu.registers[A5];
+
+    if maxevents <= 0 {
+        cpu.registers[A0] = Errno::EINVAL.into_err();
+        return;
+    }
+    if validate_guest_buffer(cpu, events, maxevents as u64 * 16).is_err() {
+        cpu.registers[A0] = Errno::EFAULT.into_err();
+        return;
+    }
+
+    cpu.registers[A0] = 0;
+}
+
 // 25
 pub fn fcntl(cpu: &mut RV64GC) {
     let fd = cpu.registers[A0];
@@ -267,6 +470,31 @@ pub fn fcntl(cpu: &mut RV64GC) {
     let arg = cpu.registers[A2];
     match cpu.filesystem.fcntl(fd, cmd, arg) {
         Ok(value) => cpu.registers[A0] = value,
+        Err(error) => cpu.registers[A0] = fs_error_to_errno(error).into_err(),
+    }
+}
+
+// 61
+pub fn getdents64(cpu: &mut RV64GC) {
+    let fd = cpu.registers[A0];
+    let dirp = cpu.registers[A1];
+    let count = cpu.registers[A2];
+    if count == 0 {
+        cpu.registers[A0] = Errno::EINVAL.into_err();
+        return;
+    }
+    if let Err(errno) = validate_guest_buffer(cpu, dirp, count) {
+        cpu.registers[A0] = errno.into_err();
+        return;
+    }
+
+    match cpu.filesystem.getdents64(fd, count as usize) {
+        Ok(bytes) => match write_bytes(cpu, dirp, &bytes) {
+            Ok(()) => cpu.registers[A0] = bytes.len() as u64,
+            Err(errno) => cpu.registers[A0] = errno.into_err(),
+        },
+        Err(FileSystemError::BadFileDescriptor) => cpu.registers[A0] = Errno::EBADF.into_err(),
+        Err(FileSystemError::InvalidInput) => cpu.registers[A0] = Errno::ENOTDIR.into_err(),
         Err(error) => cpu.registers[A0] = fs_error_to_errno(error).into_err(),
     }
 }
@@ -650,19 +878,34 @@ pub fn mmap(cpu: &mut RV64GC) {
         return;
     }
 
-    if fd != -1 && flags & MAP_ANONYMOUS == 0 {
-        warn!("file-backed mmap is not implemented");
-        cpu.registers[A0] = Errno::ENOSYS.into_err();
-        return;
-    }
-
     if flags & MAP_FIXED != 0 && addr % PAGE_SIZE != 0 {
         cpu.registers[A0] = Errno::EINVAL.into_err();
         return;
     }
 
     let requested_addr = (flags & MAP_FIXED != 0).then_some(addr);
-    match cpu.ram.mmap_anonymous(requested_addr, len) {
+    let region_flags = if prot & PROT_EXEC != 0 { 1 } else { 0 };
+    let replace = flags & MAP_FIXED != 0;
+    let mmap_result = if fd != -1 && flags & MAP_ANONYMOUS == 0 {
+        let Ok(mut data) = zeroed_buffer(len) else {
+            cpu.registers[A0] = Errno::ENOMEM.into_err();
+            return;
+        };
+        match cpu.filesystem.read_at(fd as u64, offset, &mut data) {
+            Ok(_) => cpu
+                .ram
+                .mmap_bytes(requested_addr, len, data, region_flags, replace),
+            Err(error) => {
+                cpu.registers[A0] = fs_error_to_errno(error).into_err();
+                return;
+            }
+        }
+    } else {
+        cpu.ram
+            .mmap_anonymous_with_flags(requested_addr, len, region_flags, replace)
+    };
+
+    match mmap_result {
         Ok(mmap_addr) => {
             debug!("mmap_addr: {mmap_addr:08x}");
             cpu.registers[A0] = mmap_addr;
@@ -741,7 +984,52 @@ pub fn getegid(cpu: &mut RV64GC) {
 
 // 178
 pub fn gettid(cpu: &mut RV64GC) {
-    getpid(cpu);
+    cpu.registers[A0] = cpu.thread_id();
+}
+
+// 96
+pub fn set_tid_address(cpu: &mut RV64GC) {
+    let clear_child_tid = cpu.registers[A0];
+    cpu.set_clear_child_tid((clear_child_tid != 0).then_some(clear_child_tid));
+    cpu.registers[A0] = cpu.thread_id();
+}
+
+// 179
+pub fn sysinfo(cpu: &mut RV64GC) {
+    let info = cpu.registers[A0];
+    if let Err(errno) = validate_guest_buffer(cpu, info, 112) {
+        cpu.registers[A0] = errno.into_err();
+        return;
+    }
+
+    let total_ram = 8 * 1024 * 1024 * 1024u64;
+    let free_ram = 4 * 1024 * 1024 * 1024u64;
+
+    let result = cpu
+        .ram
+        .write_doubleword(info, 3600)
+        .and_then(|_| cpu.ram.write_doubleword(info + 8, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 16, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 24, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 32, total_ram))
+        .and_then(|_| cpu.ram.write_doubleword(info + 40, free_ram))
+        .and_then(|_| cpu.ram.write_doubleword(info + 48, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 56, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 64, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 72, 0))
+        .and_then(|_| cpu.ram.write_halfword(info + 80, EMULATED_CPU_COUNT))
+        .and_then(|_| cpu.ram.write_halfword(info + 82, 0))
+        .and_then(|_| cpu.ram.write_word(info + 84, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 88, 0))
+        .and_then(|_| cpu.ram.write_doubleword(info + 96, 0))
+        .and_then(|_| cpu.ram.write_word(info + 104, 1))
+        .and_then(|_| cpu.ram.write_word(info + 108, 0));
+
+    cpu.registers[A0] = if result.is_ok() {
+        0
+    } else {
+        Errno::EFAULT.into_err()
+    };
 }
 
 // 113
@@ -765,6 +1053,127 @@ pub fn clock_gettime(cpu: &mut RV64GC) {
     }
 
     cpu.registers[A0] = 0;
+}
+
+// 115
+pub fn clock_getres(cpu: &mut RV64GC) {
+    let timespec = cpu.registers[A1];
+    if timespec == 0 {
+        cpu.registers[A0] = 0;
+        return;
+    }
+
+    if cpu
+        .ram
+        .write_doubleword(timespec, 0)
+        .and_then(|_| cpu.ram.write_doubleword(timespec + 8, 1))
+        .is_err()
+    {
+        cpu.registers[A0] = Errno::EFAULT.into_err();
+        return;
+    }
+
+    cpu.registers[A0] = 0;
+}
+
+// 123
+pub fn sched_getaffinity(cpu: &mut RV64GC) {
+    let _pid = cpu.registers[A0];
+    let cpusetsize = cpu.registers[A1];
+    let mask = cpu.registers[A2];
+
+    if cpusetsize == 0 {
+        cpu.registers[A0] = Errno::EINVAL.into_err();
+        return;
+    }
+
+    if let Err(errno) = validate_guest_buffer(cpu, mask, cpusetsize) {
+        cpu.registers[A0] = errno.into_err();
+        return;
+    }
+
+    for idx in 0..cpusetsize {
+        if cpu.ram.write_byte(mask + idx, 0).is_err() {
+            cpu.registers[A0] = Errno::EFAULT.into_err();
+            return;
+        }
+    }
+
+    let bits = (cpusetsize as usize)
+        .saturating_mul(8)
+        .min(EMULATED_CPU_COUNT as usize);
+    for cpu_idx in 0..bits {
+        let byte_addr = mask + (cpu_idx / 8) as u64;
+        let Ok(byte) = cpu.ram.read_byte(byte_addr) else {
+            cpu.registers[A0] = Errno::EFAULT.into_err();
+            return;
+        };
+        let bit = 1u8 << (cpu_idx % 8);
+        if cpu.ram.write_byte(byte_addr, byte | bit).is_err() {
+            cpu.registers[A0] = Errno::EFAULT.into_err();
+            return;
+        }
+    }
+
+    cpu.registers[A0] = 0;
+}
+
+// 122
+pub fn sched_setaffinity(cpu: &mut RV64GC) {
+    let _pid = cpu.registers[A0];
+    let cpusetsize = cpu.registers[A1];
+    let mask = cpu.registers[A2];
+
+    if cpusetsize == 0 {
+        cpu.registers[A0] = Errno::EINVAL.into_err();
+        return;
+    }
+    if let Err(errno) = validate_guest_buffer(cpu, mask, cpusetsize) {
+        cpu.registers[A0] = errno.into_err();
+        return;
+    }
+
+    cpu.registers[A0] = Errno::ENOSYS.into_err();
+}
+
+// 220
+pub fn sys_clone(cpu: &mut RV64GC) {
+    let flags = cpu.registers[A0];
+    let stack = cpu.registers[A1];
+    let parent_tid = cpu.registers[A2];
+    let tls = cpu.registers[A3];
+    let child_tid = cpu.registers[A4];
+
+    match enqueue_synthetic_clone(cpu, flags, stack, parent_tid, tls, child_tid) {
+        Ok(tid) => cpu.registers[A0] = tid,
+        Err(errno) => cpu.registers[A0] = errno.into_err(),
+    }
+}
+
+// 435
+pub fn clone3(cpu: &mut RV64GC) {
+    let args = cpu.registers[A0];
+    let size = cpu.registers[A1];
+
+    let result = (|| {
+        let flags = read_clone_arg(cpu, args, size, CLONE_ARGS_FLAGS_OFFSET)?;
+        let child_tid = read_clone_arg(cpu, args, size, CLONE_ARGS_CHILD_TID_OFFSET)?;
+        let parent_tid = read_clone_arg(cpu, args, size, CLONE_ARGS_PARENT_TID_OFFSET)?;
+        let stack = read_clone_arg(cpu, args, size, CLONE_ARGS_STACK_OFFSET)?;
+        let stack_size = read_clone_arg(cpu, args, size, CLONE_ARGS_STACK_SIZE_OFFSET)?;
+        let tls = read_clone_arg(cpu, args, size, CLONE_ARGS_TLS_OFFSET)?;
+        let child_stack = if stack != 0 && stack_size != 0 {
+            stack.checked_add(stack_size).ok_or(Errno::EINVAL)?
+        } else {
+            stack
+        };
+        enqueue_synthetic_clone(cpu, flags, child_stack, parent_tid, tls, child_tid)
+    })();
+
+    match result {
+        Ok(tid) => cpu.registers[A0] = tid,
+        Err(errno) => cpu.registers[A0] = errno.into_err(),
+    }
 }
 
 // 135
@@ -988,7 +1397,17 @@ pub fn lseek(cpu: &mut RV64GC) {
 // https://www.man7.org/linux/man-pages/man2/futex.2.html
 // NOTE: Just return FUTEX_WAIT for now
 pub fn futex(cpu: &mut RV64GC) {
-    cpu.registers[A0] = 0;
+    if cpu.is_synthetic_thread() {
+        cpu.registers[A0] = 0;
+        cpu.yield_synthetic_thread();
+        return;
+    }
+
+    cpu.make_synthetic_threads_ready();
+    cpu.registers[A0] = match run_pending_synthetic_threads(cpu) {
+        Ok(()) => 0,
+        Err(errno) => errno.into_err(),
+    };
 }
 
 // 293
@@ -1021,6 +1440,10 @@ mod tests {
         for (idx, byte) in bytes.iter().enumerate() {
             cpu.ram.write_byte(addr + idx as u64, *byte).unwrap();
         }
+    }
+
+    fn write_guest_word(cpu: &mut RV64GC, addr: u64, value: u32) {
+        cpu.ram.write_word(addr, value).unwrap();
     }
 
     fn read_guest_bytes(cpu: &RV64GC, addr: u64, len: usize) -> Vec<u8> {
@@ -1130,6 +1553,135 @@ mod tests {
 
         assert_eq!(cpu.registers[A0], 5);
         assert_eq!(cpu.stdout(), b"ab\0cd");
+    }
+
+    #[test]
+    fn sched_getaffinity_writes_a_non_empty_cpu_mask() {
+        let mut cpu = cpu_with_memory();
+        cpu.registers[A0] = 0;
+        cpu.registers[A1] = 16;
+        cpu.registers[A2] = BASE;
+
+        sched_getaffinity(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_ne!(read_guest_bytes(&cpu, BASE, 16), vec![0; 16]);
+    }
+
+    #[test]
+    fn sched_setaffinity_reports_unavailable_for_guest_fallback() {
+        let mut cpu = cpu_with_memory();
+        write_guest_bytes(&mut cpu, BASE, &[1, 0, 0, 0]);
+        cpu.registers[A0] = 0;
+        cpu.registers[A1] = 4;
+        cpu.registers[A2] = BASE;
+
+        sched_setaffinity(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], Errno::ENOSYS.into_err());
+    }
+
+    #[test]
+    fn epoll_create1_reports_unavailable_for_guest_fallback() {
+        let mut cpu = cpu_with_memory();
+        cpu.registers[A0] = O_CLOEXEC;
+
+        epoll_create1(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], Errno::ENOSYS.into_err());
+    }
+
+    #[test]
+    fn clone_enqueues_child_and_futex_drains_it() {
+        let mut cpu = cpu_with_memory();
+        write_guest_word(&mut cpu, BASE + 4, 0x0000_0513); // li a0, 0
+        write_guest_word(&mut cpu, BASE + 8, 0x05d0_0893); // li a7, 93
+        write_guest_word(&mut cpu, BASE + 12, 0x0000_0073); // ecall
+
+        let parent_tid = BASE + 0x100;
+        let child_tid = BASE + 0x104;
+        cpu.registers[Pc] = BASE;
+        cpu.registers[A0] =
+            CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        cpu.registers[A1] = 0;
+        cpu.registers[A2] = parent_tid;
+        cpu.registers[A3] = 0;
+        cpu.registers[A4] = child_tid;
+
+        sys_clone(&mut cpu);
+
+        let tid = cpu.registers[A0];
+        assert!(tid >= FIRST_SYNTHETIC_TID);
+        assert_eq!(cpu.ram.read_word(parent_tid).unwrap(), tid as u32);
+        assert_eq!(cpu.ram.read_word(child_tid).unwrap(), tid as u32);
+
+        futex(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_eq!(cpu.ram.read_word(child_tid).unwrap(), 0);
+        assert!(!cpu.should_quit);
+    }
+
+    #[test]
+    fn synthetic_child_futex_yields_without_clearing_tid() {
+        let mut cpu = cpu_with_memory();
+        write_guest_word(&mut cpu, BASE + 4, 0x0620_0893); // li a7, 98
+        write_guest_word(&mut cpu, BASE + 8, 0x0000_0073); // ecall
+        write_guest_word(&mut cpu, BASE + 12, 0x0000_0513); // li a0, 0
+        write_guest_word(&mut cpu, BASE + 16, 0x05d0_0893); // li a7, 93
+        write_guest_word(&mut cpu, BASE + 20, 0x0000_0073); // ecall
+
+        let child_tid = BASE + 0x104;
+        cpu.registers[Pc] = BASE;
+        cpu.registers[A0] = CLONE_VM | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        cpu.registers[A1] = 0;
+        cpu.registers[A2] = 0;
+        cpu.registers[A3] = 0;
+        cpu.registers[A4] = child_tid;
+
+        sys_clone(&mut cpu);
+        let tid = cpu.registers[A0];
+        assert_eq!(cpu.ram.read_word(child_tid).unwrap(), tid as u32);
+
+        futex(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_eq!(cpu.ram.read_word(child_tid).unwrap(), tid as u32);
+        assert!(!cpu.should_quit);
+
+        futex(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_eq!(cpu.ram.read_word(child_tid).unwrap(), 0);
+        assert!(!cpu.should_quit);
+    }
+
+    #[test]
+    fn sysinfo_writes_basic_memory_and_process_info() {
+        let mut cpu = cpu_with_memory();
+        cpu.registers[A0] = BASE;
+
+        sysinfo(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_eq!(
+            cpu.ram.read_doubleword(BASE + 32).unwrap(),
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(cpu.ram.read_word(BASE + 104).unwrap(), 1);
+    }
+
+    #[test]
+    fn clock_getres_writes_one_nanosecond_resolution() {
+        let mut cpu = cpu_with_memory();
+        cpu.registers[A0] = 1;
+        cpu.registers[A1] = BASE;
+
+        clock_getres(&mut cpu);
+
+        assert_eq!(cpu.registers[A0], 0);
+        assert_eq!(cpu.ram.read_doubleword(BASE).unwrap(), 0);
+        assert_eq!(cpu.ram.read_doubleword(BASE + 8).unwrap(), 1);
     }
 
     #[test]

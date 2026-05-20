@@ -7,7 +7,8 @@ use super::{
     IntegerBranchCondition, MemoryWidth, NativeInstruction,
 };
 
-const MAX_TRACE_INSTRUCTIONS: usize = 128;
+const MAX_TRACE_INSTRUCTIONS: usize = 256;
+const MIN_STRAIGHT_LINE_TRACE_INSTRUCTIONS: usize = 65;
 
 pub(super) fn trace_from_cpu(cpu: &RV64GC, start_pc: u64) -> BlockPlanResult {
     let mut state = TraceRegisterState::from_cpu(cpu);
@@ -137,7 +138,9 @@ pub(super) fn trace_from_cpu(cpu: &RV64GC, start_pc: u64) -> BlockPlanResult {
         }
     }
 
-    if operations.is_empty() || !has_side_exit_guard {
+    if operations.is_empty()
+        || (!has_side_exit_guard && operations.len() < MIN_STRAIGHT_LINE_TRACE_INSTRUCTIONS)
+    {
         return BlockPlanResult { plan: None, stop };
     }
 
@@ -280,6 +283,37 @@ impl TraceRegisterState {
             NativeInstruction::Andi { rd, rs1, imm } => {
                 self.write(rd, self.read(rs1) & imm as u64);
             }
+            NativeInstruction::ByteCopy8 {
+                registers,
+                load_base,
+                load_imm,
+                store_base,
+                store_imm,
+            } => {
+                let load_address = self.read(load_base).wrapping_add_signed(load_imm);
+                let store_address = self.read(store_base).wrapping_add_signed(store_imm);
+                let mut bytes = [0u8; 8];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    let Some(value) = self.read_memory(
+                        cpu,
+                        load_address.wrapping_add(index as u64),
+                        MemoryWidth::Byte,
+                    ) else {
+                        return false;
+                    };
+                    *byte = value as u8;
+                }
+                for (register, byte) in registers.into_iter().zip(bytes) {
+                    self.write(register, u64::from(byte));
+                }
+                for (index, byte) in bytes.into_iter().enumerate() {
+                    self.write_memory(
+                        store_address.wrapping_add(index as u64),
+                        u64::from(byte),
+                        MemoryWidth::Byte,
+                    );
+                }
+            }
             NativeInstruction::Auipc { rd, value }
             | NativeInstruction::LoadImmediate { rd, value }
             | NativeInstruction::Lui { rd, value } => {
@@ -329,6 +363,16 @@ impl TraceRegisterState {
             }
             NativeInstruction::Slli { rd, rs1, shamt } => {
                 self.write(rd, self.read(rs1) << shamt);
+            }
+            NativeInstruction::ShiftedWordOr {
+                rd,
+                rs1,
+                left_shamt,
+                right_shamt,
+            } => {
+                let value = self.read(rs1);
+                let right = sign_extend(u64::from((value as u32) >> right_shamt), 32) as u64;
+                self.write(rd, (value << left_shamt) | right);
             }
             NativeInstruction::Slliw { rd, rs1, shamt } => {
                 let value = (self.read(rs1) as u32).wrapping_shl(shamt);

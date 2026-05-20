@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    io::{self, BufRead, Write},
+    time::Duration,
+};
 
 use ratatui::{
     crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers},
@@ -7,7 +10,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal,
 };
+use riscvm_core::debug::{self, DebugWriter};
 use riscvm_debugger::debugger::{load_debugger_from_path, CommandOutput, Debugger};
+use tracing_subscriber::filter::EnvFilter;
 use tui_popup::Popup;
 use tui_prompts::{Prompt, State, TextPrompt, TextState};
 
@@ -51,7 +56,7 @@ impl<'a> App<'a> {
 }
 
 fn main() -> io::Result<()> {
-    let cli = match parse_cli(std::env::args().skip(1)) {
+    let mut cli = match parse_cli(std::env::args().skip(1)) {
         Ok(ParseResult::Run(cli)) => cli,
         Ok(ParseResult::Help) => {
             println!("{}", usage());
@@ -64,24 +69,37 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
-    let debugger = load_debugger_from_path(&cli.path, cli.guest_args)?;
-
-    if cli.batch {
-        return run_batch(debugger, cli.commands);
+    if cli.debug_file.is_none() {
+        cli.debug_file = std::env::var("RISCVM_DEBUG_FILE").ok();
     }
+    init_debugging(cli.debug_file.as_deref(), cli.verbosity, cli.quiet)?;
+    let debugger = load_debugger_from_path(&cli.path, cli.guest_args, cli.sysroot)?;
 
-    let mut term = ratatui::init();
-    term.clear()?;
-    let app_result = run(term, debugger, App::new());
-    ratatui::restore();
-    app_result
+    let result = if cli.batch {
+        run_batch(debugger, cli.commands)
+    } else if cli.cli {
+        run_cli(debugger)
+    } else {
+        let mut term = ratatui::init();
+        term.clear()?;
+        let app_result = run(term, debugger, App::new());
+        ratatui::restore();
+        app_result
+    };
+    debug::flush();
+    result
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Cli {
     path: String,
     guest_args: Vec<String>,
+    sysroot: Option<String>,
+    debug_file: Option<String>,
+    verbosity: u8,
+    quiet: bool,
     batch: bool,
+    cli: bool,
     commands: Vec<String>,
 }
 
@@ -93,8 +111,13 @@ enum ParseResult {
 
 fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
     let mut batch = false;
+    let mut cli = false;
     let mut commands = Vec::new();
     let mut path = None;
+    let mut sysroot = None;
+    let mut debug_file = None;
+    let mut verbosity = 0u8;
+    let mut quiet = false;
     let mut guest_args = Vec::new();
     let mut args = args.into_iter();
 
@@ -108,6 +131,31 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<ParseResult, Stri
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParseResult::Help),
             "--batch" => batch = true,
+            "--cli" | "--repl" => cli = true,
+            "--debug" => verbosity = verbosity.max(1),
+            "-v" | "--verbose" => verbosity = verbosity.saturating_add(1),
+            "--quiet" => quiet = true,
+            "--debug-file" | "--debug-out" => {
+                let Some(value) = args.next() else {
+                    return Err(format!("{arg} requires a path"));
+                };
+                debug_file = Some(value);
+            }
+            _ if arg.starts_with("--debug-file=") => {
+                debug_file = Some(arg.trim_start_matches("--debug-file=").to_string());
+            }
+            _ if arg.starts_with("--debug-out=") => {
+                debug_file = Some(arg.trim_start_matches("--debug-out=").to_string());
+            }
+            "--sysroot" => {
+                let Some(value) = args.next() else {
+                    return Err("--sysroot requires a path".to_string());
+                };
+                sysroot = Some(value);
+            }
+            _ if arg.starts_with("--sysroot=") => {
+                sysroot = Some(arg.trim_start_matches("--sysroot=").to_string());
+            }
             "-ex" | "--execute" | "--command" => {
                 let Some(command) = args.next() else {
                     return Err(format!("{arg} requires a debugger command"));
@@ -128,6 +176,10 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<ParseResult, Stri
         }
     }
 
+    if batch && cli {
+        return Err("--batch and --cli cannot be used together".to_string());
+    }
+
     let Some(path) = path else {
         return Err("missing binary path".to_string());
     };
@@ -135,9 +187,40 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<ParseResult, Stri
     Ok(ParseResult::Run(Cli {
         path,
         guest_args,
+        sysroot,
+        debug_file,
+        verbosity,
+        quiet,
         batch,
+        cli,
         commands,
     }))
+}
+
+fn init_debugging(debug_file: Option<&str>, verbosity: u8, quiet: bool) -> io::Result<()> {
+    if let Some(path) = debug_file {
+        debug::init_debug_file(path)?;
+    }
+    debug::install_signal_handlers()?;
+
+    let default_filter = if quiet {
+        "error"
+    } else {
+        match verbosity {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(debug_file.is_none())
+        .without_time()
+        .with_writer(|| DebugWriter)
+        .try_init();
+    Ok(())
 }
 
 fn run_batch(mut debugger: Debugger, commands: Vec<String>) -> io::Result<()> {
@@ -148,6 +231,9 @@ fn run_batch(mut debugger: Debugger, commands: Vec<String>) -> io::Result<()> {
     };
 
     for command in commands {
+        if finish_if_signal() {
+            break;
+        }
         println!("riscvm-debugger> {command}");
         let output = debugger.execute_command(&command);
         println!("{}", output.message);
@@ -158,12 +244,68 @@ fn run_batch(mut debugger: Debugger, commands: Vec<String>) -> io::Result<()> {
     Ok(())
 }
 
+fn run_cli(mut debugger: Debugger) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let mut line = String::new();
+
+    writeln!(
+        stdout,
+        "riscvm-debugger CLI. Type help for commands, quit to exit."
+    )?;
+
+    loop {
+        if finish_if_signal() {
+            writeln!(stdout)?;
+            return Ok(());
+        }
+        write!(stdout, "riscvm-debugger> ")?;
+        stdout.flush()?;
+
+        line.clear();
+        let read = match stdin.read_line(&mut line) {
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && debug::termination_requested() =>
+            {
+                writeln!(stdout)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            writeln!(stdout)?;
+            return Ok(());
+        }
+
+        let command = line.trim();
+        if command.is_empty() {
+            continue;
+        }
+
+        let output = debugger.execute_command(command);
+        writeln!(stdout, "{}", output.message)?;
+        if output.should_quit {
+            return Ok(());
+        }
+    }
+}
+
 fn usage() -> &'static str {
     "Usage:
   riscvm-debugger <binary> [guest-args...]
+  riscvm-debugger --cli [--sysroot PATH] <binary> [guest-args...]
   riscvm-debugger --batch -ex <command> [-ex <command>...] <binary> [guest-args...]
 
 Options:
+  --cli                   run an interactive line-oriented CLI instead of the TUI
+  --sysroot PATH          mount a Linux sysroot for dynamically linked guests
+  --debug                 enable debug-level logging
+  -v, --verbose           increase tracing verbosity; repeat for trace-level logs
+  --quiet                 only emit tracing errors
+  --debug-file PATH       write tracing/JIT/profile diagnostics to PATH
   --batch                 run commands without starting the TUI
   -ex, --execute <cmd>    execute one debugger command; implies --batch
   -h, --help              show this help"
@@ -174,6 +316,9 @@ fn run(mut term: DefaultTerminal, mut debugger: Debugger, mut app: App) -> io::R
     table_state.select_first();
 
     loop {
+        if finish_if_signal() {
+            return Ok(());
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -202,6 +347,9 @@ fn run(mut term: DefaultTerminal, mut debugger: Debugger, mut app: App) -> io::R
             draw(frame, &debugger, &mut app, &mut table_state, rows.clone());
         })?;
 
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
         if let event::Event::Key(key) = event::read()? {
             match app.input_mode {
                 InputMode::Normal => {
@@ -277,6 +425,18 @@ fn run(mut term: DefaultTerminal, mut debugger: Debugger, mut app: App) -> io::R
             }
         }
     }
+}
+
+fn finish_if_signal() -> bool {
+    if let Some(signal) = debug::termination_signal() {
+        debug::line(format_args!(
+            "[signal] received {} ({signal}); flushed debug output before debugger exit",
+            debug::signal_name(signal)
+        ));
+        debug::flush();
+        return true;
+    }
+    false
 }
 
 fn draw(
@@ -510,7 +670,12 @@ mod tests {
             Cli {
                 path: "program".to_string(),
                 guest_args: vec!["one".to_string(), "two".to_string()],
+                sysroot: None,
+                debug_file: None,
+                verbosity: 0,
+                quiet: false,
                 batch: false,
+                cli: false,
                 commands: Vec::new(),
             }
         );
@@ -533,7 +698,9 @@ mod tests {
 
         assert_eq!(cli.path, "program");
         assert_eq!(cli.guest_args, vec!["guest"]);
+        assert_eq!(cli.sysroot, None);
         assert!(cli.batch);
+        assert!(!cli.cli);
         assert_eq!(cli.commands, vec!["break pc", "continue limit 5"]);
     }
 
@@ -546,7 +713,42 @@ mod tests {
 
         assert_eq!(cli.path, "-program");
         assert!(cli.guest_args.is_empty());
+        assert_eq!(cli.sysroot, None);
         assert!(cli.batch);
+        assert!(!cli.cli);
+    }
+
+    #[test]
+    fn parses_cli_mode() {
+        let ParseResult::Run(cli) = parse(&["--cli", "program", "guest"]).unwrap() else {
+            panic!("expected runnable cli");
+        };
+
+        assert_eq!(cli.path, "program");
+        assert_eq!(cli.guest_args, vec!["guest"]);
+        assert_eq!(cli.sysroot, None);
+        assert!(cli.cli);
+        assert!(!cli.batch);
+    }
+
+    #[test]
+    fn parses_sysroot_before_binary_path() {
+        let ParseResult::Run(cli) = parse(&["--cli", "--sysroot=/opt/riscv", "program"]).unwrap()
+        else {
+            panic!("expected runnable cli");
+        };
+
+        assert_eq!(cli.path, "program");
+        assert_eq!(cli.sysroot, Some("/opt/riscv".to_string()));
+        assert!(cli.cli);
+    }
+
+    #[test]
+    fn rejects_cli_and_batch_together() {
+        assert_eq!(
+            parse(&["--cli", "--batch", "program"]).unwrap_err(),
+            "--batch and --cli cannot be used together"
+        );
     }
 
     #[test]

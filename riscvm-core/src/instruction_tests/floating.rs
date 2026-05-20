@@ -218,6 +218,12 @@ fn rv64d_arithmetic_fused_compare_class_and_conversions_follow_current_model() {
     Fcvtwud(RD, 1, RS1).execute_instruction(&mut cpu);
     assert_eq!(cpu.registers[RD as usize], 6);
 
+    Fcvtld(RD, 1, RS2).execute_instruction(&mut cpu);
+    assert_eq!(cpu.registers[RD as usize], (-2i64) as u64);
+
+    Fcvtlud(RD, 1, RS1).execute_instruction(&mut cpu);
+    assert_eq!(cpu.registers[RD as usize], 6);
+
     cpu.registers[RS1 as usize] = (-7i64) as u64;
     Fcvtdw(RD, 0, RS1).execute_instruction(&mut cpu);
     assert_eq!(cpu.float_registers[RD as usize], (-7.0f64).to_bits());
@@ -225,6 +231,20 @@ fn rv64d_arithmetic_fused_compare_class_and_conversions_follow_current_model() {
     cpu.registers[RS1 as usize] = 7;
     Fcvtdwu(RD, 0, RS1).execute_instruction(&mut cpu);
     assert_eq!(cpu.float_registers[RD as usize], 7.0f64.to_bits());
+
+    cpu.registers[RS1 as usize] = (-7_000_000_000i64) as u64;
+    Fcvtdl(RD, 0, RS1).execute_instruction(&mut cpu);
+    assert_eq!(
+        cpu.float_registers[RD as usize],
+        (-7_000_000_000i64 as f64).to_bits()
+    );
+
+    cpu.registers[RS1 as usize] = 1u64 << 40;
+    Fcvtdlu(RD, 0, RS1).execute_instruction(&mut cpu);
+    assert_eq!(
+        cpu.float_registers[RD as usize],
+        ((1u64 << 40) as f64).to_bits()
+    );
 }
 
 #[test]
@@ -247,6 +267,10 @@ fn rv64d_implemented_double_transfers_and_sign_injection_follow_spec() {
 
     Fmvxd(RD, RS2).execute_instruction(&mut cpu);
     assert_eq!(cpu.registers[RD as usize], (-3.5f64).to_bits());
+
+    cpu.registers[RS1 as usize] = 0x400c_0000_0000_0000;
+    Fmvdx(RD, RS1).execute_instruction(&mut cpu);
+    assert_eq!(cpu.float_registers[RD as usize], 3.5f64.to_bits());
 
     cpu.float_registers[RS1 as usize] = 1.5f64.to_bits();
     cpu.float_registers[RS2 as usize] = (-2.0f64).to_bits();
@@ -300,6 +324,11 @@ fn decoder_keeps_adjacent_float_variants_distinct() {
     assert!(matches!(cpu.find_instruction(0xe2021353), Fclassd(..)));
     assert!(matches!(cpu.find_instruction(0xc20272d3), Fcvtwd(..)));
     assert!(matches!(cpu.find_instruction(0xc21272d3), Fcvtwud(..)));
+    assert!(matches!(cpu.find_instruction(0xc2267553), Fcvtld(..)));
+    assert!(matches!(cpu.find_instruction(0xc2367553), Fcvtlud(..)));
     assert!(matches!(cpu.find_instruction(0xd20272d3), Fcvtdw(..)));
     assert!(matches!(cpu.find_instruction(0xd21272d3), Fcvtdwu(..)));
+    assert!(matches!(cpu.find_instruction(0xd2267553), Fcvtdl(..)));
+    assert!(matches!(cpu.find_instruction(0xd2367553), Fcvtdlu(..)));
+    assert!(matches!(cpu.find_instruction(0xf20605d3), Fmvdx(..)));
 }

@@ -1,7 +1,11 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use crate::cpu::RV64GC;
+use crate::cpu::{RV64GC, RV64GC_RAM_OFFSET};
+use crate::ram::{
+    JIT_FAST_CACHE_END_OFFSET, JIT_FAST_CACHE_ENTRIES, JIT_FAST_CACHE_READ_PTR_OFFSET,
+    JIT_FAST_CACHE_START_OFFSET, JIT_FAST_CACHE_WRITE_PTR_OFFSET, RAM_JIT_FAST_CACHES_OFFSET,
+};
 
 use super::{
     jit_runtime_atomic, jit_runtime_binary, jit_runtime_csr, jit_runtime_direct_write_ptr,
@@ -9,7 +13,8 @@ use super::{
     jit_runtime_load_i16, jit_runtime_load_i32, jit_runtime_load_i8, jit_runtime_load_u16,
     jit_runtime_load_u32, jit_runtime_load_u64, jit_runtime_load_u8, jit_runtime_store_u16,
     jit_runtime_store_u32, jit_runtime_store_u64, jit_runtime_store_u8, jit_runtime_trap,
-    jit_runtime_try_direct_read_ptr, ArithmeticXorToggleLoop, BlockOperationKind, BlockPlan,
+    jit_runtime_try_direct_byte_copy, jit_runtime_try_direct_read_ptr,
+    jit_runtime_try_direct_write_ptr, ArithmeticXorToggleLoop, BlockOperationKind, BlockPlan,
     CompiledBlock, CountedDiamondLoop, DivisionRecurrenceLoop, FibonacciRecurrenceLoop,
     IntegerBranchCondition, JitError, JitTier, NativeEmission, NativeInstruction, RuntimeBinaryOp,
     RuntimeCsrOp, StoreLoadForwardLoop,
@@ -31,7 +36,12 @@ const A64_ZERO_REGISTER: u8 = 31;
 const LOOP_TEMP: u8 = 16;
 const ARG_REG_PTR: u8 = 1;
 const BLOCK_HOST_REGISTERS: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17];
+const MEMORY_BLOCK_HOST_REGISTERS: [u8; 10] = [3, 4, 5, 6, 7, 8, 13, 14, 15, 17];
 const LOOP_HOST_REGISTERS: [u8; 7] = [22, 23, 24, 25, 26, 27, 28];
+const FAST_CACHE_START: u8 = 22;
+const FAST_CACHE_END: u8 = 23;
+const FAST_CACHE_READ_PTR: u8 = 24;
+const FAST_CACHE_WRITE_PTR: u8 = 25;
 const LOOP_CALLER_HOST_REGISTERS: [u8; 7] = [2, 3, 4, 5, 6, 7, 8];
 // Pure self-loops do not call out, so these caller-saved registers can hold
 // invariant divisor masks without forcing the guest register bank into x22-x28.
@@ -362,6 +372,46 @@ impl AArch64Backend {
         if tier == JitTier::Trace {
             let mut code = A64Emitter::new(include_listing);
             if let Some(trace_loop) = RegisterAllocatedTraceLoop::from_plan(plan) {
+                if let Some(region) = ByteXorTraceLoop::from_trace_loop(&trace_loop) {
+                    code.emit_byte_xor_trace_loop(&trace_loop, region);
+                    let code_bytes = code.finish();
+                    let code_len = code_bytes.bytes.len();
+                    let native = NativeBlock::new(code_bytes.bytes)?;
+                    return Ok(CompiledBlock {
+                        native,
+                        fingerprint: plan.fingerprint.clone(),
+                        code_version: plan.code_version,
+                        instruction_count: plan.guest_instruction_count,
+                        code_len,
+                        native_listing: code_bytes.listing,
+                        profile_instructions: plan.profile_instructions(),
+                        tier: JitTier::Baseline,
+                        execution_count: 0,
+                        next_optimized_attempt_count: 0,
+                        ends_with_self_loop_branch: plan.ends_with_self_loop_branch(),
+                        ends_with_loop_back_edge: plan.ends_with_loop_back_edge(),
+                    });
+                }
+                if let Some(region) = ByteCopyTraceLoop::from_trace_loop(&trace_loop) {
+                    code.emit_byte_copy_trace_loop(&trace_loop, region);
+                    let code_bytes = code.finish();
+                    let code_len = code_bytes.bytes.len();
+                    let native = NativeBlock::new(code_bytes.bytes)?;
+                    return Ok(CompiledBlock {
+                        native,
+                        fingerprint: plan.fingerprint.clone(),
+                        code_version: plan.code_version,
+                        instruction_count: plan.guest_instruction_count,
+                        code_len,
+                        native_listing: code_bytes.listing,
+                        profile_instructions: plan.profile_instructions(),
+                        tier: JitTier::Baseline,
+                        execution_count: 0,
+                        next_optimized_attempt_count: 0,
+                        ends_with_self_loop_branch: plan.ends_with_self_loop_branch(),
+                        ends_with_loop_back_edge: plan.ends_with_loop_back_edge(),
+                    });
+                }
                 if let Some(region) = DirectLoadTraceLoop::from_trace_loop(&trace_loop) {
                     code.emit_direct_load_trace_loop(&trace_loop, region);
                     let code_bytes = code.finish();
@@ -493,6 +543,7 @@ impl AArch64Backend {
             }
         }
 
+        code.preload_fast_cache = plan_uses_fast_memory(plan);
         code.emit_prologue(self_loop_branch.is_some());
 
         if let Some(branch) = self_loop_branch {
@@ -516,11 +567,7 @@ impl AArch64Backend {
                 format!("mov x0, x{DYNAMIC_INSTRUCTION_COUNT} ; return executed instructions"),
             );
         } else {
-            for operation in &plan.operations {
-                match operation.kind() {
-                    BlockOperationKind::Native(instruction) => code.emit_instruction(instruction),
-                }
-            }
+            code.emit_linear_operations(&plan.operations);
             if !matches!(
                 plan.operations.last().map(|operation| operation.kind()),
                 Some(BlockOperationKind::Native(instruction)) if instruction.terminates_block()
@@ -568,6 +615,10 @@ impl NativeBlock {
         let entry = unsafe { std::mem::transmute::<*mut u8, JitFn>(memory.ptr) };
 
         Ok(Self { memory, entry })
+    }
+
+    pub(crate) fn entry_address(&self) -> usize {
+        self.memory.ptr as usize
     }
 
     pub fn execute(&self, cpu: &mut RV64GC) -> u64 {
@@ -782,6 +833,7 @@ fn writes_integer_register(instruction: NativeInstruction, register: u8) -> bool
         | NativeInstruction::RuntimeCsr { rd, .. }
         | NativeInstruction::Sll { rd, .. }
         | NativeInstruction::Slli { rd, .. }
+        | NativeInstruction::ShiftedWordOr { rd, .. }
         | NativeInstruction::Slliw { rd, .. }
         | NativeInstruction::Sllw { rd, .. }
         | NativeInstruction::Slt { rd, .. }
@@ -800,6 +852,7 @@ fn writes_integer_register(instruction: NativeInstruction, register: u8) -> bool
         | NativeInstruction::Subw { rd, .. }
         | NativeInstruction::Xor { rd, .. }
         | NativeInstruction::Xori { rd, .. } => rd == register,
+        NativeInstruction::ByteCopy8 { registers, .. } => registers.contains(&register),
         NativeInstruction::Beq { .. }
         | NativeInstruction::Bge { .. }
         | NativeInstruction::Bgeu { .. }
@@ -833,6 +886,8 @@ struct RegisterAllocatedLoop<'a> {
     guest_to_host: [u8; 33],
     loaded_registers: Vec<(u8, u8)>,
     dirty_registers: Vec<(u8, u8)>,
+    memory_slow_path_preserve_hosts: Vec<u8>,
+    memory_slow_path_cache_entries: usize,
     guest_instruction_count: u64,
 }
 
@@ -891,6 +946,8 @@ impl<'a> RegisterAllocatedLoop<'a> {
             guest_to_host,
             loaded_registers,
             dirty_registers,
+            memory_slow_path_preserve_hosts: Vec::new(),
+            memory_slow_path_cache_entries: JIT_FAST_CACHE_ENTRIES,
             guest_instruction_count: plan.guest_instruction_count as u64,
         })
     }
@@ -1226,6 +1283,116 @@ impl DirectLoadTraceLoop {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ByteCopyTraceLoop {
+    value_register: u8,
+    source_pointer_register: u8,
+    destination_pointer_register: u8,
+    limit_register: u8,
+    loop_exit_pc: u64,
+    guest_instruction_count: u64,
+}
+
+impl ByteCopyTraceLoop {
+    fn from_trace_loop(trace_loop: &RegisterAllocatedTraceLoop<'_>) -> Option<Self> {
+        if trace_loop.operations.len() != 4 {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Load {
+            rd: value_register,
+            rs1: source_pointer_register,
+            imm: load_imm,
+            width: source_width,
+            signed,
+        }) = trace_loop.operations[0].kind()
+        else {
+            return None;
+        };
+        if value_register == 0
+            || source_pointer_register == 0
+            || load_imm != 0
+            || source_width != super::MemoryWidth::Byte
+            || signed
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addi {
+            rd: destination_pointer_register,
+            rs1: destination_source,
+            imm: destination_delta,
+        }) = trace_loop.operations[1].kind()
+        else {
+            return None;
+        };
+        if destination_pointer_register == 0
+            || destination_source != destination_pointer_register
+            || destination_delta != 1
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addi {
+            rd: source_dest,
+            rs1: source_source,
+            imm: source_delta,
+        }) = trace_loop.operations[2].kind()
+        else {
+            return None;
+        };
+        if source_dest != source_pointer_register
+            || source_source != source_pointer_register
+            || source_delta != 1
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Store {
+            rs1: store_base,
+            rs2: store_value,
+            imm: store_imm,
+            width: store_width,
+        }) = trace_loop.operations[3].kind()
+        else {
+            return None;
+        };
+        if store_base != destination_pointer_register
+            || store_value != value_register
+            || store_imm != -1
+            || store_width != super::MemoryWidth::Byte
+        {
+            return None;
+        }
+
+        if trace_loop.loop_guard.rs1 != destination_pointer_register
+            || trace_loop.loop_guard.rs2 == 0
+            || trace_loop.loop_guard.condition != A64Cond::Ne
+            || trace_loop.loop_guard.guest_instruction_count != 5
+        {
+            return None;
+        }
+
+        if !distinct_nonzero_trace_registers(&[
+            value_register,
+            source_pointer_register,
+            destination_pointer_register,
+            trace_loop.loop_guard.rs2,
+        ]) {
+            return None;
+        }
+
+        Some(Self {
+            value_register,
+            source_pointer_register,
+            destination_pointer_register,
+            limit_register: trace_loop.loop_guard.rs2,
+            loop_exit_pc: trace_loop.loop_guard.side_exit_pc,
+            guest_instruction_count: trace_loop.loop_guard.guest_instruction_count,
+        })
+    }
+}
+
 struct TraceLoopBranch {
     rs1: u8,
     rs2: u8,
@@ -1234,11 +1401,321 @@ struct TraceLoopBranch {
     guest_instruction_count: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ByteXorTraceLoop {
+    value_register: u8,
+    source_value_register: u8,
+    source_pointer_register: u8,
+    destination_pointer_register: u8,
+    key_base_register: u8,
+    key_index_register: u8,
+    counter_register: u8,
+    key_mask: i64,
+    counter_exit_pc: u64,
+    index_exit_pc: u64,
+    counter_exit_instructions: u64,
+    loop_guest_instructions: u64,
+}
+
+struct StoreBurst {
+    base_register: u8,
+    min_imm: i64,
+    byte_len: u16,
+    count: usize,
+}
+
+impl ByteXorTraceLoop {
+    fn from_trace_loop(trace_loop: &RegisterAllocatedTraceLoop<'_>) -> Option<Self> {
+        if trace_loop.operations.len() != 11 {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Add {
+            rd: key_address_register,
+            rs1: key_base_register,
+            rs2: key_index_register,
+        }) = trace_loop.operations[0].kind()
+        else {
+            return None;
+        };
+        if key_address_register == 0 || key_base_register == 0 || key_index_register == 0 {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Load {
+            rd: source_value_register,
+            rs1: source_pointer_register,
+            imm: source_imm,
+            width: source_width,
+            signed: source_signed,
+        }) = trace_loop.operations[1].kind()
+        else {
+            return None;
+        };
+        if source_value_register == 0
+            || source_pointer_register == 0
+            || source_imm != 0
+            || source_width != super::MemoryWidth::Byte
+            || !source_signed
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Load {
+            rd: key_value_register,
+            rs1: key_address_source,
+            imm: key_imm,
+            width: key_width,
+            signed: key_signed,
+        }) = trace_loop.operations[2].kind()
+        else {
+            return None;
+        };
+        if key_value_register != key_address_register
+            || key_address_source != key_address_register
+            || key_imm != 0
+            || key_width != super::MemoryWidth::Byte
+            || !key_signed
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Xor {
+            rd: value_register,
+            rs1: xor_lhs,
+            rs2: xor_rhs,
+        }) = trace_loop.operations[3].kind()
+        else {
+            return None;
+        };
+        if value_register != key_value_register
+            || !((xor_lhs == key_value_register && xor_rhs == source_value_register)
+                || (xor_lhs == source_value_register && xor_rhs == key_value_register))
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addiw {
+            rd: index_add_dest,
+            rs1: index_add_source,
+            imm: index_delta,
+        }) = trace_loop.operations[4].kind()
+        else {
+            return None;
+        };
+        if index_add_dest != key_index_register
+            || index_add_source != key_index_register
+            || index_delta != 1
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Store {
+            rs1: destination_pointer_register,
+            rs2: store_value_register,
+            imm: store_imm,
+            width: store_width,
+        }) = trace_loop.operations[5].kind()
+        else {
+            return None;
+        };
+        if destination_pointer_register == 0
+            || store_value_register != value_register
+            || store_imm != 0
+            || store_width != super::MemoryWidth::Byte
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Andi {
+            rd: index_mask_dest,
+            rs1: index_mask_source,
+            imm: key_mask,
+        }) = trace_loop.operations[6].kind()
+        else {
+            return None;
+        };
+        if index_mask_dest != key_index_register
+            || index_mask_source != key_index_register
+            || key_mask != 15
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addi {
+            rd: counter_register,
+            rs1: counter_source,
+            imm: counter_delta,
+        }) = trace_loop.operations[7].kind()
+        else {
+            return None;
+        };
+        if counter_register == 0 || counter_source != counter_register || counter_delta != -1 {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addi {
+            rd: destination_increment_dest,
+            rs1: destination_increment_source,
+            imm: destination_delta,
+        }) = trace_loop.operations[8].kind()
+        else {
+            return None;
+        };
+        if destination_increment_dest != destination_pointer_register
+            || destination_increment_source != destination_pointer_register
+            || destination_delta != 1
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::Addi {
+            rd: source_increment_dest,
+            rs1: source_increment_source,
+            imm: source_delta,
+        }) = trace_loop.operations[9].kind()
+        else {
+            return None;
+        };
+        if source_increment_dest != source_pointer_register
+            || source_increment_source != source_pointer_register
+            || source_delta != 1
+        {
+            return None;
+        }
+
+        let BlockOperationKind::Native(NativeInstruction::TraceGuard {
+            rs1: guard_lhs,
+            rs2: guard_rhs,
+            condition,
+            continue_on_taken,
+            side_exit_pc: counter_exit_pc,
+            executed_instructions: counter_exit_instructions,
+            ..
+        }) = trace_loop.operations[10].kind()
+        else {
+            return None;
+        };
+        if guard_lhs != counter_register
+            || guard_rhs != 0
+            || condition != IntegerBranchCondition::Eq
+            || continue_on_taken
+            || counter_exit_instructions != 11
+        {
+            return None;
+        }
+
+        if trace_loop.loop_guard.rs1 != key_index_register
+            || trace_loop.loop_guard.rs2 != 0
+            || trace_loop.loop_guard.condition != A64Cond::Ne
+            || trace_loop.loop_guard.guest_instruction_count != 12
+        {
+            return None;
+        }
+
+        if !distinct_nonzero_trace_registers(&[
+            value_register,
+            source_value_register,
+            source_pointer_register,
+            destination_pointer_register,
+            key_base_register,
+            key_index_register,
+            counter_register,
+        ]) {
+            return None;
+        }
+
+        Some(Self {
+            value_register,
+            source_value_register,
+            source_pointer_register,
+            destination_pointer_register,
+            key_base_register,
+            key_index_register,
+            counter_register,
+            key_mask,
+            counter_exit_pc,
+            index_exit_pc: trace_loop.loop_guard.side_exit_pc,
+            counter_exit_instructions,
+            loop_guest_instructions: trace_loop.loop_guard.guest_instruction_count,
+        })
+    }
+}
+
+fn distinct_nonzero_trace_registers(registers: &[u8]) -> bool {
+    let mut seen = Vec::with_capacity(registers.len());
+    for register in registers {
+        if *register == 0 || seen.contains(register) {
+            return false;
+        }
+        seen.push(*register);
+    }
+    true
+}
+
+fn store_burst_from_operations(
+    operations: &[super::BlockOperation],
+    start: usize,
+) -> Option<StoreBurst> {
+    const MIN_STORE_BURST: usize = 3;
+    const MAX_STORE_BURST: usize = 16;
+    const MAX_DIRECT_STORE_BURST_BYTES: i64 = 512;
+
+    let BlockOperationKind::Native(NativeInstruction::Store {
+        rs1: base_register,
+        imm: first_imm,
+        width,
+        ..
+    }) = operations.get(start)?.kind()
+    else {
+        return None;
+    };
+    if base_register == 0 || width != super::MemoryWidth::Double || first_imm < 0 {
+        return None;
+    }
+
+    let mut count = 0;
+    let mut min_imm = first_imm;
+    let mut max_imm = first_imm;
+    for operation in operations.iter().skip(start).take(MAX_STORE_BURST) {
+        let BlockOperationKind::Native(NativeInstruction::Store {
+            rs1, imm, width, ..
+        }) = operation.kind()
+        else {
+            break;
+        };
+        if rs1 != base_register || width != super::MemoryWidth::Double || imm < 0 || imm % 8 != 0 {
+            break;
+        }
+        min_imm = min_imm.min(imm);
+        max_imm = max_imm.max(imm);
+        count += 1;
+    }
+
+    if count < MIN_STORE_BURST {
+        return None;
+    }
+
+    let byte_len = max_imm.checked_sub(min_imm)?.checked_add(8)?;
+    if !(8..=MAX_DIRECT_STORE_BURST_BYTES).contains(&byte_len) {
+        return None;
+    }
+
+    Some(StoreBurst {
+        base_register,
+        min_imm,
+        byte_len: byte_len as u16,
+        count,
+    })
+}
+
 struct RegisterAllocatedBlock<'a> {
     operations: &'a [super::BlockOperation],
     guest_to_host: [u8; 33],
     loaded_registers: Vec<(u8, u8)>,
     dirty_registers: Vec<(u8, u8)>,
+    memory_slow_path_preserve_hosts: Vec<u8>,
+    memory_slow_path_cache_entries: usize,
     guest_instruction_count: u64,
 }
 
@@ -1248,24 +1725,39 @@ impl<'a> RegisterAllocatedBlock<'a> {
             return None;
         }
 
+        let uses_memory_access = plan.operations.iter().any(|operation| {
+            matches!(
+                operation.kind(),
+                BlockOperationKind::Native(
+                    NativeInstruction::Load { .. } | NativeInstruction::Store { .. }
+                )
+            )
+        });
         let mut guest_registers = Vec::new();
         let mut dirty_registers = Vec::new();
         for operation in &plan.operations {
             let BlockOperationKind::Native(instruction) = operation.kind();
             collect_block_instruction_registers(
                 instruction,
+                uses_memory_access,
                 &mut guest_registers,
                 &mut dirty_registers,
             )?;
         }
 
-        if guest_registers.len() > BLOCK_HOST_REGISTERS.len() {
+        let host_registers: &[u8] = if uses_memory_access {
+            &MEMORY_BLOCK_HOST_REGISTERS
+        } else {
+            &BLOCK_HOST_REGISTERS
+        };
+
+        if guest_registers.len() > host_registers.len() {
             return None;
         }
 
         let mut guest_to_host = [UNMAPPED_GUEST_REGISTER; 33];
         for (index, guest) in guest_registers.into_iter().enumerate() {
-            let host = BLOCK_HOST_REGISTERS[index];
+            let host = host_registers[index];
             guest_to_host[guest as usize] = host;
         }
         let loaded_registers = initial_load_registers(&plan.operations, None, &guest_to_host);
@@ -1279,12 +1771,29 @@ impl<'a> RegisterAllocatedBlock<'a> {
                 (host != UNMAPPED_GUEST_REGISTER).then_some((guest, host))
             })
             .collect();
+        let memory_slow_path_preserve_hosts = if uses_memory_access {
+            guest_to_host
+                .iter()
+                .copied()
+                .filter(|host| *host != UNMAPPED_GUEST_REGISTER)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let memory_slow_path_cache_entries =
+            if uses_memory_access && block_loads_share_base_register(&plan.operations) {
+                1
+            } else {
+                JIT_FAST_CACHE_ENTRIES
+            };
 
         Some(Self {
             operations: &plan.operations,
             guest_to_host,
             loaded_registers,
             dirty_registers,
+            memory_slow_path_preserve_hosts,
+            memory_slow_path_cache_entries,
             guest_instruction_count: plan.guest_instruction_count as u64,
         })
     }
@@ -1432,6 +1941,7 @@ where
         | NativeInstruction::Load { rs1, .. }
         | NativeInstruction::Move { rs: rs1, .. }
         | NativeInstruction::Ori { rs1, .. }
+        | NativeInstruction::ShiftedWordOr { rs1, .. }
         | NativeInstruction::Slli { rs1, .. }
         | NativeInstruction::Slliw { rs1, .. }
         | NativeInstruction::Slti { rs1, .. }
@@ -1441,6 +1951,14 @@ where
         | NativeInstruction::Srli { rs1, .. }
         | NativeInstruction::Srliw { rs1, .. }
         | NativeInstruction::Xori { rs1, .. } => push(rs1),
+        NativeInstruction::ByteCopy8 {
+            load_base,
+            store_base,
+            ..
+        } => {
+            push(load_base);
+            push(store_base);
+        }
         NativeInstruction::Store { rs1, rs2, .. } => {
             push(rs1);
             push(rs2);
@@ -1494,6 +2012,7 @@ where
         | NativeInstruction::RuntimeCsr { rd, .. }
         | NativeInstruction::Sll { rd, .. }
         | NativeInstruction::Slli { rd, .. }
+        | NativeInstruction::ShiftedWordOr { rd, .. }
         | NativeInstruction::Slliw { rd, .. }
         | NativeInstruction::Sllw { rd, .. }
         | NativeInstruction::Slt { rd, .. }
@@ -1512,6 +2031,11 @@ where
         | NativeInstruction::Subw { rd, .. }
         | NativeInstruction::Xor { rd, .. }
         | NativeInstruction::Xori { rd, .. } => push(rd),
+        NativeInstruction::ByteCopy8 { registers, .. } => {
+            for register in registers {
+                push(register);
+            }
+        }
         NativeInstruction::JumpRegLink { .. } => push(1),
         NativeInstruction::Beq { .. }
         | NativeInstruction::Bge { .. }
@@ -1541,6 +2065,7 @@ where
 
 fn collect_block_instruction_registers(
     instruction: NativeInstruction,
+    allow_memory: bool,
     guest_registers: &mut Vec<u8>,
     dirty_registers: &mut Vec<u8>,
 ) -> Option<()> {
@@ -1581,7 +2106,19 @@ fn collect_block_instruction_registers(
             Some(())
         }
         NativeInstruction::TraceGuard { rs1, rs2, .. }
-        | NativeInstruction::TraceLoopGuard { rs1, rs2, .. } => {
+        | NativeInstruction::TraceLoopGuard { rs1, rs2, .. }
+            if !allow_memory =>
+        {
+            push_guest_register(rs1, guest_registers);
+            push_guest_register(rs2, guest_registers);
+            Some(())
+        }
+        NativeInstruction::Load { rd, rs1, .. } if allow_memory => {
+            push_guest_register(rs1, guest_registers);
+            push_dirty_register(rd, guest_registers, dirty_registers);
+            Some(())
+        }
+        NativeInstruction::Store { rs1, rs2, .. } if allow_memory => {
             push_guest_register(rs1, guest_registers);
             push_guest_register(rs2, guest_registers);
             Some(())
@@ -1589,8 +2126,9 @@ fn collect_block_instruction_registers(
         NativeInstruction::ArithmeticXorToggleLoop(_)
         | NativeInstruction::DivisionRecurrenceLoop(_)
         | NativeInstruction::Load { .. }
-        | NativeInstruction::Store { .. }
-        | NativeInstruction::StoreLoadForwardLoop(_) => None,
+        | NativeInstruction::StoreLoadForwardLoop(_)
+        | NativeInstruction::TraceGuard { .. }
+        | NativeInstruction::TraceLoopGuard { .. } => None,
         _ => collect_loop_instruction_registers(instruction, guest_registers, dirty_registers),
     }
 }
@@ -1636,6 +2174,7 @@ fn collect_loop_instruction_registers(
         | NativeInstruction::AndBranch { rd, rs1, .. }
         | NativeInstruction::Andi { rd, rs1, .. }
         | NativeInstruction::Ori { rd, rs1, .. }
+        | NativeInstruction::ShiftedWordOr { rd, rs1, .. }
         | NativeInstruction::Slli { rd, rs1, .. }
         | NativeInstruction::Slliw { rd, rs1, .. }
         | NativeInstruction::Slti { rd, rs1, .. }
@@ -1688,6 +2227,53 @@ fn push_guest_register(guest: u8, registers: &mut Vec<u8>) {
     }
 }
 
+fn plan_uses_fast_memory(plan: &BlockPlan) -> bool {
+    plan.operations.iter().any(|operation| {
+        matches!(
+            operation.kind(),
+            BlockOperationKind::Native(
+                NativeInstruction::ByteCopy8 { .. }
+                    | NativeInstruction::Load { .. }
+                    | NativeInstruction::Store { .. }
+            )
+        )
+    })
+}
+
+fn memory_slow_path_preserve_hosts(preserve_hosts: &[u8], host_dst: Option<u8>) -> Vec<u8> {
+    let mut hosts = Vec::new();
+    for &host in preserve_hosts {
+        if Some(host) == host_dst || hosts.contains(&host) {
+            continue;
+        }
+        hosts.push(host);
+    }
+    hosts
+}
+
+fn block_loads_share_base_register(operations: &[super::BlockOperation]) -> bool {
+    let mut base = None;
+    for operation in operations {
+        let BlockOperationKind::Native(instruction) = operation.kind();
+        if let NativeInstruction::Load { rs1, .. } = instruction {
+            match base {
+                Some(base) if base != rs1 => return false,
+                Some(_) => {}
+                None => base = Some(rs1),
+            }
+        }
+    }
+    base.is_some()
+}
+
+fn host_register_name(host: u8) -> String {
+    if host == A64_ZERO_REGISTER {
+        "xzr".to_string()
+    } else {
+        format!("x{host}")
+    }
+}
+
 struct TraceSideExitPatch {
     branch_offset: usize,
     condition: A64Cond,
@@ -1697,11 +2283,29 @@ struct TraceSideExitPatch {
     dirty_registers: Vec<(u8, u8)>,
 }
 
+enum MemorySlowPath {
+    Load {
+        branches: Vec<(usize, A64Cond)>,
+        continuation: usize,
+        guest_rd: Option<u8>,
+        host_dst: Option<u8>,
+        addr_host: u8,
+        width: u64,
+        signed: bool,
+        runtime_target: u64,
+        runtime_name: &'static str,
+        preserve_hosts: Vec<u8>,
+        cache_entries: usize,
+    },
+}
+
 struct A64Emitter {
     code: Vec<u8>,
     listing: Vec<NativeEmission>,
     include_listing: bool,
+    preload_fast_cache: bool,
     trace_side_exits: Vec<TraceSideExitPatch>,
+    memory_slow_paths: Vec<MemorySlowPath>,
 }
 
 impl A64Emitter {
@@ -1710,11 +2314,14 @@ impl A64Emitter {
             code: Vec::new(),
             listing: Vec::new(),
             include_listing,
+            preload_fast_cache: false,
             trace_side_exits: Vec::new(),
+            memory_slow_paths: Vec::new(),
         }
     }
 
-    fn finish(self) -> EmittedCode {
+    fn finish(mut self) -> EmittedCode {
+        self.emit_memory_slow_paths();
         EmittedCode {
             bytes: self.code,
             listing: self.listing,
@@ -1725,8 +2332,42 @@ impl A64Emitter {
         self.code.len()
     }
 
+    fn emit_memory_slow_paths(&mut self) {
+        let slow_paths = std::mem::take(&mut self.memory_slow_paths);
+        for slow_path in slow_paths {
+            match slow_path {
+                MemorySlowPath::Load {
+                    branches,
+                    continuation,
+                    guest_rd,
+                    host_dst,
+                    addr_host,
+                    width,
+                    signed,
+                    runtime_target,
+                    runtime_name,
+                    preserve_hosts,
+                    cache_entries,
+                } => self.emit_fast_memory_load_slow_path(
+                    branches,
+                    continuation,
+                    guest_rd,
+                    host_dst,
+                    addr_host,
+                    width,
+                    signed,
+                    runtime_target,
+                    runtime_name,
+                    preserve_hosts,
+                    cache_entries,
+                ),
+            }
+        }
+    }
+
     fn emit_trace_plan(&mut self, plan: &BlockPlan) {
         let loops_in_native_trace = trace_plan_has_native_loop(plan);
+        self.preload_fast_cache = plan_uses_fast_memory(plan);
         self.emit_prologue(loops_in_native_trace);
         if loops_in_native_trace {
             self.emit(
@@ -1884,6 +2525,13 @@ impl A64Emitter {
                 target,
                 fallthrough,
             } => self.emit_conditional_branch(rs1, rs2, target, fallthrough, A64Cond::Ne),
+            NativeInstruction::ByteCopy8 {
+                registers,
+                load_base,
+                load_imm,
+                store_base,
+                store_imm,
+            } => self.emit_byte_copy8(registers, load_base, load_imm, store_base, store_imm),
             NativeInstruction::ArithmeticXorToggleLoop(_) => debug_assert!(
                 false,
                 "arithmetic xor toggle loops must be emitted as whole regions"
@@ -1971,6 +2619,12 @@ impl A64Emitter {
             NativeInstruction::Slli { rd, rs1, shamt } => {
                 self.emit_shift_imm(rd, rs1, shamt, ShiftImmediateKind::Lsl)
             }
+            NativeInstruction::ShiftedWordOr {
+                rd,
+                rs1,
+                left_shamt,
+                right_shamt,
+            } => self.emit_shifted_word_or(rd, rs1, left_shamt, right_shamt),
             NativeInstruction::Slliw { rd, rs1, shamt } => {
                 self.emit_shift_imm32(rd, rs1, shamt, ShiftImmediateKind::Lsl)
             }
@@ -2072,6 +2726,158 @@ impl A64Emitter {
                 self.emit_logical_imm(rd, rs1, imm, LogicalImmediateOp::Eor)
             }
         }
+    }
+
+    fn emit_linear_operations(&mut self, operations: &[super::BlockOperation]) {
+        let mut index = 0;
+        while index < operations.len() {
+            if self.preload_fast_cache {
+                if let Some(burst) = store_burst_from_operations(operations, index) {
+                    self.emit_fast_store_burst(operations, index, &burst);
+                    index += burst.count;
+                    continue;
+                }
+            }
+
+            let BlockOperationKind::Native(instruction) = operations[index].kind();
+            self.emit_instruction(instruction);
+            index += 1;
+        }
+    }
+
+    fn emit_fast_store_burst(
+        &mut self,
+        operations: &[super::BlockOperation],
+        start: usize,
+        burst: &StoreBurst,
+    ) {
+        debug_assert!(self.preload_fast_cache);
+        debug_assert!(burst.count > 0);
+
+        self.load_guest_register(SCRATCH0, burst.base_register);
+        self.emit_host_add_sub_imm_or_move(SCRATCH0, SCRATCH0, burst.min_imm);
+        self.emit_host_add_sub_imm_any(SCRATCH1, SCRATCH0, i64::from(burst.byte_len));
+        self.emit(
+            cmp_reg(SCRATCH1, SCRATCH0),
+            format!("cmp x{SCRATCH1}, x{SCRATCH0} ; fast store burst overflow"),
+        );
+        let mut next_entry_branches = Vec::with_capacity(4);
+        next_entry_branches.push((
+            self.emit_patchable_branch("b.lo .jit_store_burst_fallback".to_string()),
+            A64Cond::Lo,
+        ));
+        let mut store_body_branches = Vec::with_capacity(JIT_FAST_CACHE_ENTRIES);
+        for entry in 0..JIT_FAST_CACHE_ENTRIES {
+            let entry_offset = self.current_offset();
+            for (branch, condition) in std::mem::take(&mut next_entry_branches) {
+                self.patch_branch(branch, b_cond(branch, entry_offset, condition));
+            }
+
+            let (cache_start, cache_end, cache_write_ptr) = if entry == 0 {
+                (FAST_CACHE_START, FAST_CACHE_END, FAST_CACHE_WRITE_PTR)
+            } else {
+                let start_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_START_OFFSET);
+                let end_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_END_OFFSET);
+                let write_ptr_offset =
+                    jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_WRITE_PTR_OFFSET);
+                self.emit(
+                    ldr_u64(SCRATCH2, CPU_PTR, start_offset),
+                    format!(
+                        "ldr x{SCRATCH2}, [x{CPU_PTR}, #{start_offset}] ; fast store burst cache {entry} start"
+                    ),
+                );
+                self.emit(
+                    ldr_u64(SCRATCH3, CPU_PTR, end_offset),
+                    format!(
+                        "ldr x{SCRATCH3}, [x{CPU_PTR}, #{end_offset}] ; fast store burst cache {entry} end"
+                    ),
+                );
+                self.emit(
+                    ldr_u64(LOOP_TEMP, CPU_PTR, write_ptr_offset),
+                    format!(
+                        "ldr x{LOOP_TEMP}, [x{CPU_PTR}, #{write_ptr_offset}] ; fast store burst cache {entry} write ptr"
+                    ),
+                );
+                (SCRATCH2, SCRATCH3, LOOP_TEMP)
+            };
+
+            self.emit(
+                cmp_reg(SCRATCH0, cache_start),
+                format!(
+                    "cmp x{SCRATCH0}, x{cache_start} ; fast store burst cache {entry} lower bound"
+                ),
+            );
+            next_entry_branches.push((
+                self.emit_patchable_branch("b.lo .jit_store_burst_next_cache".to_string()),
+                A64Cond::Lo,
+            ));
+            self.emit(
+                cmp_reg(cache_end, SCRATCH1),
+                format!(
+                    "cmp x{cache_end}, x{SCRATCH1} ; fast store burst cache {entry} upper bound"
+                ),
+            );
+            next_entry_branches.push((
+                self.emit_patchable_branch("b.lo .jit_store_burst_next_cache".to_string()),
+                A64Cond::Lo,
+            ));
+            self.emit(
+                cmp_reg(cache_write_ptr, A64_ZERO_REGISTER),
+                format!("cmp x{cache_write_ptr}, xzr ; fast store burst cache {entry} write ptr"),
+            );
+            next_entry_branches.push((
+                self.emit_patchable_branch("b.eq .jit_store_burst_next_cache".to_string()),
+                A64Cond::Eq,
+            ));
+            self.emit(
+                sub_reg(SCRATCH0, SCRATCH0, cache_start),
+                format!(
+                    "sub x{SCRATCH0}, x{SCRATCH0}, x{cache_start} ; fast store burst cache {entry} offset"
+                ),
+            );
+            self.emit(
+                add_reg(SCRATCH0, cache_write_ptr, SCRATCH0),
+                format!(
+                    "add x{SCRATCH0}, x{cache_write_ptr}, x{SCRATCH0} ; fast store burst cache {entry} host ptr"
+                ),
+            );
+            store_body_branches
+                .push(self.emit_patchable_branch("b .jit_store_burst_body".to_string()));
+        }
+
+        let fallback_offset = self.current_offset();
+        for (branch, condition) in next_entry_branches {
+            self.patch_branch(branch, b_cond(branch, fallback_offset, condition));
+        }
+        for operation in operations.iter().skip(start).take(burst.count) {
+            let BlockOperationKind::Native(instruction) = operation.kind();
+            self.emit_instruction(instruction);
+        }
+        let fallback_done_branch =
+            self.emit_patchable_branch("b .jit_store_burst_done".to_string());
+
+        let store_body_offset = self.current_offset();
+        for branch in store_body_branches {
+            self.patch_branch(branch, b_uncond(branch, store_body_offset));
+        }
+        for operation in operations.iter().skip(start).take(burst.count) {
+            let BlockOperationKind::Native(NativeInstruction::Store { rs2, imm, .. }) =
+                operation.kind()
+            else {
+                unreachable!("store burst contains only stores");
+            };
+            let value = self.load_guest_register_or_zero(SCRATCH1, rs2);
+            let offset = u16::try_from(imm - burst.min_imm).expect("store burst offset");
+            self.emit(
+                str_u64(value, SCRATCH0, offset),
+                format!("str x{value}, [x{SCRATCH0}, #{offset}] ; fast store burst x{rs2}"),
+            );
+        }
+        let done_offset = self.current_offset();
+        self.patch_branch(
+            fallback_done_branch,
+            b_uncond(fallback_done_branch, done_offset),
+        );
     }
 
     fn emit_arithmetic_xor_toggle_loop(&mut self, region: ArithmeticXorToggleLoop) {
@@ -4120,11 +4926,575 @@ impl A64Emitter {
         self.emit_trace_side_exits();
     }
 
+    fn emit_byte_copy_trace_loop(
+        &mut self,
+        trace_loop: &RegisterAllocatedTraceLoop<'_>,
+        region: ByteCopyTraceLoop,
+    ) {
+        let value_host = trace_loop.host_or_zero(region.value_register);
+        let source_pointer_host = trace_loop.host_or_zero(region.source_pointer_register);
+        let destination_pointer_host = trace_loop.host_or_zero(region.destination_pointer_register);
+        let limit_host = trace_loop.host_or_zero(region.limit_register);
+
+        self.emit_prologue(true);
+        self.emit(
+            mov_reg(DYNAMIC_INSTRUCTION_COUNT, A64_ZERO_REGISTER),
+            format!("mov x{DYNAMIC_INSTRUCTION_COUNT}, xzr ; byte-copy trace instruction count"),
+        );
+
+        for (guest, host) in &trace_loop.loaded_registers {
+            self.load_guest_register(*host, *guest);
+        }
+
+        let mut generic_branches = Vec::new();
+        self.emit(
+            cmp_reg(destination_pointer_host, limit_host),
+            format!("cmp x{destination_pointer_host}, x{limit_host} ; byte-copy trace count"),
+        );
+        generic_branches.push((
+            self.emit_patchable_branch("b.hs .byte_copy_trace_generic".to_string()),
+            A64Cond::Hs,
+        ));
+        self.emit(
+            sub_reg(
+                DYNAMIC_INSTRUCTION_COUNT,
+                limit_host,
+                destination_pointer_host,
+            ),
+            format!(
+                "sub x{DYNAMIC_INSTRUCTION_COUNT}, x{limit_host}, x{destination_pointer_host} ; byte-copy trace length"
+            ),
+        );
+
+        self.emit(
+            mov_reg(0, CPU_PTR),
+            format!("mov x0, x{CPU_PTR} ; byte-copy cpu"),
+        );
+        self.emit(
+            mov_reg(1, destination_pointer_host),
+            format!("mov x1, x{destination_pointer_host} ; byte-copy destination"),
+        );
+        self.emit(
+            mov_reg(2, source_pointer_host),
+            format!("mov x2, x{source_pointer_host} ; byte-copy source"),
+        );
+        self.emit(
+            mov_reg(3, DYNAMIC_INSTRUCTION_COUNT),
+            format!("mov x3, x{DYNAMIC_INSTRUCTION_COUNT} ; byte-copy length"),
+        );
+        self.emit_call(
+            jit_runtime_try_direct_byte_copy as *const () as usize as u64,
+            "jit_runtime_try_direct_byte_copy",
+        );
+        self.mov_imm64(SCRATCH0, u64::MAX);
+        self.emit(
+            cmp_reg(0, SCRATCH0),
+            format!("cmp x0, x{SCRATCH0} ; byte-copy direct result"),
+        );
+        generic_branches.push((
+            self.emit_patchable_branch("b.eq .byte_copy_trace_generic".to_string()),
+            A64Cond::Eq,
+        ));
+
+        self.emit(
+            mov_reg(value_host, 0),
+            format!("mov x{value_host}, x0 ; byte-copy final byte"),
+        );
+        self.emit(
+            add_reg(
+                source_pointer_host,
+                source_pointer_host,
+                DYNAMIC_INSTRUCTION_COUNT,
+            ),
+            format!(
+                "add x{source_pointer_host}, x{source_pointer_host}, x{DYNAMIC_INSTRUCTION_COUNT} ; byte-copy final source"
+            ),
+        );
+        self.emit(
+            mov_reg(destination_pointer_host, limit_host),
+            format!("mov x{destination_pointer_host}, x{limit_host} ; byte-copy final destination"),
+        );
+        self.mov_imm64(SCRATCH0, region.guest_instruction_count);
+        self.emit(
+            mul_reg(DYNAMIC_INSTRUCTION_COUNT, DYNAMIC_INSTRUCTION_COUNT, SCRATCH0),
+            format!(
+                "mul x{DYNAMIC_INSTRUCTION_COUNT}, x{DYNAMIC_INSTRUCTION_COUNT}, x{SCRATCH0} ; byte-copy trace instructions"
+            ),
+        );
+        self.flush_regalloc_dirty_registers(&trace_loop.dirty_registers);
+        self.store_pc(region.loop_exit_pc);
+        self.emit(
+            mov_reg(0, DYNAMIC_INSTRUCTION_COUNT),
+            format!("mov x0, x{DYNAMIC_INSTRUCTION_COUNT} ; return byte-copy trace instructions"),
+        );
+        self.emit_epilogue(true);
+        self.ret();
+
+        let generic_offset = self.current_offset();
+        for (branch, condition) in generic_branches {
+            self.patch_branch(branch, b_cond(branch, generic_offset, condition));
+        }
+        self.emit(
+            mov_reg(DYNAMIC_INSTRUCTION_COUNT, A64_ZERO_REGISTER),
+            format!("mov x{DYNAMIC_INSTRUCTION_COUNT}, xzr ; byte-copy generic instruction count"),
+        );
+        self.emit_register_allocated_trace_loop_body(trace_loop);
+    }
+
+    fn emit_byte_xor_trace_loop(
+        &mut self,
+        trace_loop: &RegisterAllocatedTraceLoop<'_>,
+        region: ByteXorTraceLoop,
+    ) {
+        const SOURCE_PTR_HOST: u8 = 9;
+        const KEY_PTR_HOST: u8 = 10;
+        const DESTINATION_PTR_HOST: u8 = 11;
+        const ITERATIONS_HOST: u8 = 12;
+        const KEY_ADDRESS_HOST: u8 = 13;
+        const STACK_DUMMY_HOST: u8 = 15;
+        const KEY_PERIOD_BYTES: u16 = 16;
+
+        let value_host = trace_loop.host_or_zero(region.value_register);
+        let source_value_host = trace_loop.host_or_zero(region.source_value_register);
+        let source_pointer_host = trace_loop.host_or_zero(region.source_pointer_register);
+        let destination_pointer_host = trace_loop.host_or_zero(region.destination_pointer_register);
+        let key_base_host = trace_loop.host_or_zero(region.key_base_register);
+        let key_index_host = trace_loop.host_or_zero(region.key_index_register);
+        let counter_host = trace_loop.host_or_zero(region.counter_register);
+
+        self.emit_prologue(true);
+        self.emit(
+            mov_reg(DYNAMIC_INSTRUCTION_COUNT, A64_ZERO_REGISTER),
+            format!("mov x{DYNAMIC_INSTRUCTION_COUNT}, xzr ; byte-xor trace instruction count"),
+        );
+
+        for (guest, host) in &trace_loop.loaded_registers {
+            self.load_guest_register(*host, *guest);
+        }
+
+        let mut fallback_branches = Vec::new();
+        let mut fallback_pop_source_branches = Vec::new();
+        let mut fallback_pop_source_key_branches = Vec::new();
+
+        self.emit(
+            cmp_reg(counter_host, A64_ZERO_REGISTER),
+            format!("cmp x{counter_host}, xzr ; byte-xor trace positive count"),
+        );
+        fallback_branches.push((
+            self.emit_patchable_branch("b.eq .byte_xor_trace_generic".to_string()),
+            A64Cond::Eq,
+        ));
+        self.emit(
+            cmp_imm(key_index_host, KEY_PERIOD_BYTES),
+            format!("cmp x{key_index_host}, #{KEY_PERIOD_BYTES} ; byte-xor trace key index"),
+        );
+        fallback_branches.push((
+            self.emit_patchable_branch("b.hs .byte_xor_trace_generic".to_string()),
+            A64Cond::Hs,
+        ));
+
+        self.emit_byte_xor_trace_trip_setup(
+            key_base_host,
+            key_index_host,
+            counter_host,
+            ITERATIONS_HOST,
+            KEY_ADDRESS_HOST,
+            KEY_PERIOD_BYTES,
+        );
+
+        self.emit(
+            mov_reg(0, CPU_PTR),
+            format!("mov x0, x{CPU_PTR} ; byte-xor source cpu"),
+        );
+        self.emit(
+            mov_reg(1, source_pointer_host),
+            format!("mov x1, x{source_pointer_host} ; byte-xor source address"),
+        );
+        self.emit(
+            mov_reg(2, ITERATIONS_HOST),
+            format!("mov x2, x{ITERATIONS_HOST} ; byte-xor source length"),
+        );
+        self.emit_call(
+            jit_runtime_try_direct_read_ptr as *const () as usize as u64,
+            "jit_runtime_try_direct_read_ptr",
+        );
+        self.emit(
+            cmp_reg(0, A64_ZERO_REGISTER),
+            "cmp x0, xzr ; byte-xor source direct ptr".to_string(),
+        );
+        fallback_branches.push((
+            self.emit_patchable_branch("b.eq .byte_xor_trace_generic".to_string()),
+            A64Cond::Eq,
+        ));
+        self.emit(
+            stp_pre(0, A64_ZERO_REGISTER, 31, -16),
+            "stp x0, xzr, [sp, #-16]! ; byte-xor save source ptr".to_string(),
+        );
+
+        self.emit_byte_xor_trace_trip_setup(
+            key_base_host,
+            key_index_host,
+            counter_host,
+            ITERATIONS_HOST,
+            KEY_ADDRESS_HOST,
+            KEY_PERIOD_BYTES,
+        );
+        self.emit(
+            mov_reg(0, CPU_PTR),
+            format!("mov x0, x{CPU_PTR} ; byte-xor key cpu"),
+        );
+        self.emit(
+            mov_reg(1, KEY_ADDRESS_HOST),
+            format!("mov x1, x{KEY_ADDRESS_HOST} ; byte-xor key address"),
+        );
+        self.emit(
+            mov_reg(2, ITERATIONS_HOST),
+            format!("mov x2, x{ITERATIONS_HOST} ; byte-xor key length"),
+        );
+        self.emit_call(
+            jit_runtime_try_direct_read_ptr as *const () as usize as u64,
+            "jit_runtime_try_direct_read_ptr",
+        );
+        self.emit(
+            cmp_reg(0, A64_ZERO_REGISTER),
+            "cmp x0, xzr ; byte-xor key direct ptr".to_string(),
+        );
+        fallback_pop_source_branches.push((
+            self.emit_patchable_branch("b.eq .byte_xor_trace_pop_source".to_string()),
+            A64Cond::Eq,
+        ));
+        self.emit(
+            stp_pre(0, A64_ZERO_REGISTER, 31, -16),
+            "stp x0, xzr, [sp, #-16]! ; byte-xor save key ptr".to_string(),
+        );
+
+        self.emit_byte_xor_trace_trip_setup(
+            key_base_host,
+            key_index_host,
+            counter_host,
+            ITERATIONS_HOST,
+            KEY_ADDRESS_HOST,
+            KEY_PERIOD_BYTES,
+        );
+        self.emit(
+            mov_reg(0, CPU_PTR),
+            format!("mov x0, x{CPU_PTR} ; byte-xor destination cpu"),
+        );
+        self.emit(
+            mov_reg(1, destination_pointer_host),
+            format!("mov x1, x{destination_pointer_host} ; byte-xor destination address"),
+        );
+        self.emit(
+            mov_reg(2, ITERATIONS_HOST),
+            format!("mov x2, x{ITERATIONS_HOST} ; byte-xor destination length"),
+        );
+        self.emit_call(
+            jit_runtime_try_direct_write_ptr as *const () as usize as u64,
+            "jit_runtime_try_direct_write_ptr",
+        );
+        self.emit(
+            cmp_reg(0, A64_ZERO_REGISTER),
+            "cmp x0, xzr ; byte-xor destination direct ptr".to_string(),
+        );
+        fallback_pop_source_key_branches.push((
+            self.emit_patchable_branch("b.eq .byte_xor_trace_pop_source_key".to_string()),
+            A64Cond::Eq,
+        ));
+        self.emit(
+            mov_reg(DESTINATION_PTR_HOST, 0),
+            format!("mov x{DESTINATION_PTR_HOST}, x0 ; byte-xor destination host ptr"),
+        );
+        self.emit_byte_xor_trace_trip_setup(
+            key_base_host,
+            key_index_host,
+            counter_host,
+            ITERATIONS_HOST,
+            KEY_ADDRESS_HOST,
+            KEY_PERIOD_BYTES,
+        );
+        self.emit(
+            ldp_post(KEY_PTR_HOST, STACK_DUMMY_HOST, 31, 16),
+            format!(
+                "ldp x{KEY_PTR_HOST}, x{STACK_DUMMY_HOST}, [sp], #16 ; byte-xor restore key ptr"
+            ),
+        );
+        self.emit(
+            ldp_post(SOURCE_PTR_HOST, STACK_DUMMY_HOST, 31, 16),
+            format!("ldp x{SOURCE_PTR_HOST}, x{STACK_DUMMY_HOST}, [sp], #16 ; byte-xor restore source ptr"),
+        );
+
+        let key_mask = region.key_mask as u64;
+        let key_mask_imm = encode_logical_immediate(key_mask, 64).expect("byte-xor trace key mask");
+        self.emit(
+            cmp_imm(ITERATIONS_HOST, 8),
+            format!("cmp x{ITERATIONS_HOST}, #8 ; byte-xor trace chunk count"),
+        );
+        let scalar_entry_branch =
+            self.emit_patchable_branch("b.lo .byte_xor_trace_scalar".to_string());
+        self.emit(
+            ldr_u64(source_value_host, SOURCE_PTR_HOST, 0),
+            format!("ldr x{source_value_host}, [x{SOURCE_PTR_HOST}] ; byte-xor source chunk"),
+        );
+        self.emit(
+            ldr_u64(value_host, KEY_PTR_HOST, 0),
+            format!("ldr x{value_host}, [x{KEY_PTR_HOST}] ; byte-xor key chunk"),
+        );
+        self.emit(
+            eor_reg(KEY_ADDRESS_HOST, source_value_host, value_host),
+            format!(
+                "eor x{KEY_ADDRESS_HOST}, x{source_value_host}, x{value_host} ; byte-xor chunk"
+            ),
+        );
+        self.emit(
+            str_u64(KEY_ADDRESS_HOST, DESTINATION_PTR_HOST, 0),
+            format!("str x{KEY_ADDRESS_HOST}, [x{DESTINATION_PTR_HOST}] ; byte-xor chunk store"),
+        );
+        self.emit_shift_imm64_host(
+            source_value_host,
+            source_value_host,
+            56,
+            ShiftImmediateKind::Lsr,
+            " ; byte-xor source chunk last byte",
+        );
+        self.emit(
+            sbfm64(source_value_host, source_value_host, 0, 7),
+            format!(
+                "sxtb x{source_value_host}, w{source_value_host} ; byte-xor source chunk last byte"
+            ),
+        );
+        self.emit_shift_imm64_host(
+            value_host,
+            value_host,
+            56,
+            ShiftImmediateKind::Lsr,
+            " ; byte-xor key chunk last byte",
+        );
+        self.emit(
+            sbfm64(value_host, value_host, 0, 7),
+            format!("sxtb x{value_host}, w{value_host} ; byte-xor key chunk last byte"),
+        );
+        self.emit(
+            eor_reg(value_host, value_host, source_value_host),
+            format!(
+                "eor x{value_host}, x{value_host}, x{source_value_host} ; byte-xor chunk last value"
+            ),
+        );
+        self.emit_host_add_sub_imm_any(SOURCE_PTR_HOST, SOURCE_PTR_HOST, 8);
+        self.emit_host_add_sub_imm_any(KEY_PTR_HOST, KEY_PTR_HOST, 8);
+        self.emit_host_add_sub_imm_any(DESTINATION_PTR_HOST, DESTINATION_PTR_HOST, 8);
+        self.emit_host_add_sub_imm_any(source_pointer_host, source_pointer_host, 8);
+        self.emit_host_add_sub_imm_any(destination_pointer_host, destination_pointer_host, 8);
+        self.emit_host_add_sub_imm_any(key_index_host, key_index_host, 8);
+        self.emit(
+            LogicalImmediateOp::And.imm64(key_index_host, key_index_host, key_mask_imm),
+            format!(
+                "and x{key_index_host}, x{key_index_host}, #0x{key_mask:x} ; byte-xor chunk key index"
+            ),
+        );
+        self.emit_host_add_sub_imm_any(counter_host, counter_host, -8);
+        self.emit_host_add_sub_imm_any(
+            DYNAMIC_INSTRUCTION_COUNT,
+            DYNAMIC_INSTRUCTION_COUNT,
+            (region.loop_guest_instructions * 8 - 1) as i64,
+        );
+        self.emit(
+            cmp_reg(counter_host, A64_ZERO_REGISTER),
+            format!("cmp x{counter_host}, xzr ; byte-xor chunk counter exit"),
+        );
+        let chunk_counter_exit_branch =
+            self.emit_patchable_branch("b.eq .byte_xor_trace_counter_exit".to_string());
+        self.emit_host_add_sub_imm_any(DYNAMIC_INSTRUCTION_COUNT, DYNAMIC_INSTRUCTION_COUNT, 1);
+        self.emit(
+            cmp_reg(key_index_host, A64_ZERO_REGISTER),
+            format!("cmp x{key_index_host}, xzr ; byte-xor chunk key period exit"),
+        );
+        let chunk_index_exit_branch =
+            self.emit_patchable_branch("b.eq .byte_xor_trace_index_exit".to_string());
+
+        let scalar_entry_offset = self.current_offset();
+        self.patch_branch(
+            scalar_entry_branch,
+            b_cond(scalar_entry_branch, scalar_entry_offset, A64Cond::Lo),
+        );
+
+        let loop_start = self.current_offset();
+        self.emit(
+            ldr_u8(source_value_host, SOURCE_PTR_HOST, 0),
+            format!("ldrb w{source_value_host}, [x{SOURCE_PTR_HOST}] ; byte-xor source byte"),
+        );
+        self.emit(
+            sbfm64(source_value_host, source_value_host, 0, 7),
+            format!("sxtb x{source_value_host}, w{source_value_host} ; byte-xor source byte"),
+        );
+        self.emit(
+            ldr_u8(value_host, KEY_PTR_HOST, 0),
+            format!("ldrb w{value_host}, [x{KEY_PTR_HOST}] ; byte-xor key byte"),
+        );
+        self.emit(
+            sbfm64(value_host, value_host, 0, 7),
+            format!("sxtb x{value_host}, w{value_host} ; byte-xor key byte"),
+        );
+        self.emit(
+            eor_reg(value_host, value_host, source_value_host),
+            format!("eor x{value_host}, x{value_host}, x{source_value_host} ; byte-xor value"),
+        );
+        self.emit(
+            str_u8(value_host, DESTINATION_PTR_HOST, 0),
+            format!("strb w{value_host}, [x{DESTINATION_PTR_HOST}] ; byte-xor store"),
+        );
+        self.emit_host_add_sub_imm_any(SOURCE_PTR_HOST, SOURCE_PTR_HOST, 1);
+        self.emit_host_add_sub_imm_any(KEY_PTR_HOST, KEY_PTR_HOST, 1);
+        self.emit_host_add_sub_imm_any(DESTINATION_PTR_HOST, DESTINATION_PTR_HOST, 1);
+        self.emit_host_add_sub_imm_any(source_pointer_host, source_pointer_host, 1);
+        self.emit_host_add_sub_imm_any(destination_pointer_host, destination_pointer_host, 1);
+        self.emit_host_add_sub_imm_any(key_index_host, key_index_host, 1);
+        self.emit(
+            LogicalImmediateOp::And.imm64(key_index_host, key_index_host, key_mask_imm),
+            format!(
+                "and x{key_index_host}, x{key_index_host}, #0x{key_mask:x} ; byte-xor key index"
+            ),
+        );
+        self.emit_host_add_sub_imm_any(counter_host, counter_host, -1);
+        self.emit_host_add_sub_imm_any(
+            DYNAMIC_INSTRUCTION_COUNT,
+            DYNAMIC_INSTRUCTION_COUNT,
+            region.counter_exit_instructions as i64,
+        );
+        self.emit(
+            cmp_reg(counter_host, A64_ZERO_REGISTER),
+            format!("cmp x{counter_host}, xzr ; byte-xor counter exit"),
+        );
+        let counter_exit_branch =
+            self.emit_patchable_branch("b.eq .byte_xor_trace_counter_exit".to_string());
+        self.emit_host_add_sub_imm_any(
+            DYNAMIC_INSTRUCTION_COUNT,
+            DYNAMIC_INSTRUCTION_COUNT,
+            (region.loop_guest_instructions - region.counter_exit_instructions) as i64,
+        );
+        self.emit(
+            cmp_reg(key_index_host, A64_ZERO_REGISTER),
+            format!("cmp x{key_index_host}, xzr ; byte-xor key period exit"),
+        );
+        let index_exit_branch =
+            self.emit_patchable_branch("b.eq .byte_xor_trace_index_exit".to_string());
+        let loop_branch = self.current_offset();
+        self.emit(
+            b_cond(loop_branch, loop_start, A64Cond::Ne),
+            "b.ne .byte_xor_trace_loop".to_string(),
+        );
+
+        let index_exit_offset = self.current_offset();
+        self.patch_branch(
+            chunk_index_exit_branch,
+            b_cond(chunk_index_exit_branch, index_exit_offset, A64Cond::Eq),
+        );
+        self.patch_branch(
+            index_exit_branch,
+            b_cond(index_exit_branch, index_exit_offset, A64Cond::Eq),
+        );
+        self.flush_regalloc_dirty_registers(&trace_loop.dirty_registers);
+        self.store_pc(region.index_exit_pc);
+        self.emit(
+            mov_reg(0, DYNAMIC_INSTRUCTION_COUNT),
+            format!("mov x0, x{DYNAMIC_INSTRUCTION_COUNT} ; return byte-xor trace instructions"),
+        );
+        self.emit_epilogue(true);
+        self.ret();
+
+        let counter_exit_offset = self.current_offset();
+        self.patch_branch(
+            chunk_counter_exit_branch,
+            b_cond(chunk_counter_exit_branch, counter_exit_offset, A64Cond::Eq),
+        );
+        self.patch_branch(
+            counter_exit_branch,
+            b_cond(counter_exit_branch, counter_exit_offset, A64Cond::Eq),
+        );
+        self.flush_regalloc_dirty_registers(&trace_loop.dirty_registers);
+        self.store_pc(region.counter_exit_pc);
+        self.emit(
+            mov_reg(0, DYNAMIC_INSTRUCTION_COUNT),
+            format!(
+                "mov x0, x{DYNAMIC_INSTRUCTION_COUNT} ; return byte-xor counter-exit instructions"
+            ),
+        );
+        self.emit_epilogue(true);
+        self.ret();
+
+        let pop_source_key_offset = self.current_offset();
+        for (branch, condition) in fallback_pop_source_key_branches {
+            self.patch_branch(branch, b_cond(branch, pop_source_key_offset, condition));
+        }
+        self.emit(
+            ldp_post(KEY_PTR_HOST, STACK_DUMMY_HOST, 31, 16),
+            format!(
+                "ldp x{KEY_PTR_HOST}, x{STACK_DUMMY_HOST}, [sp], #16 ; byte-xor discard key ptr"
+            ),
+        );
+        let pop_source_branch =
+            self.emit_patchable_branch("b .byte_xor_trace_pop_source".to_string());
+
+        let pop_source_offset = self.current_offset();
+        for (branch, condition) in fallback_pop_source_branches {
+            self.patch_branch(branch, b_cond(branch, pop_source_offset, condition));
+        }
+        self.emit(
+            ldp_post(SOURCE_PTR_HOST, STACK_DUMMY_HOST, 31, 16),
+            format!("ldp x{SOURCE_PTR_HOST}, x{STACK_DUMMY_HOST}, [sp], #16 ; byte-xor discard source ptr"),
+        );
+
+        let generic_offset = self.current_offset();
+        self.patch_branch(
+            pop_source_branch,
+            b_uncond(pop_source_branch, generic_offset),
+        );
+        for (branch, condition) in fallback_branches {
+            self.patch_branch(branch, b_cond(branch, generic_offset, condition));
+        }
+        self.emit_register_allocated_trace_loop_body(trace_loop);
+    }
+
+    fn emit_byte_xor_trace_trip_setup(
+        &mut self,
+        key_base_host: u8,
+        key_index_host: u8,
+        counter_host: u8,
+        iterations_host: u8,
+        key_address_host: u8,
+        key_period_bytes: u16,
+    ) {
+        self.mov_imm64(iterations_host, u64::from(key_period_bytes));
+        self.emit(
+            sub_reg(iterations_host, iterations_host, key_index_host),
+            format!(
+                "sub x{iterations_host}, x{iterations_host}, x{key_index_host} ; byte-xor trace key span"
+            ),
+        );
+        self.emit(
+            cmp_reg(counter_host, iterations_host),
+            format!("cmp x{counter_host}, x{iterations_host} ; byte-xor trace trip clamp"),
+        );
+        self.emit(
+            csel(iterations_host, counter_host, iterations_host, A64Cond::Lo),
+            format!(
+                "csel x{iterations_host}, x{counter_host}, x{iterations_host}, lo ; byte-xor trace iterations"
+            ),
+        );
+        self.emit(
+            add_reg(key_address_host, key_base_host, key_index_host),
+            format!(
+                "add x{key_address_host}, x{key_base_host}, x{key_index_host} ; byte-xor trace key address"
+            ),
+        );
+    }
+
     fn emit_direct_load_trace_loop(
         &mut self,
         trace_loop: &RegisterAllocatedTraceLoop<'_>,
         region: DirectLoadTraceLoop,
     ) {
+        const NEON_CHUNK_BYTES: u16 = 16;
+        const NEON_ZERO_VECTOR: u8 = 0;
         const UNROLLED_LOADS: u16 = 4;
         const READ_PTR_HOST: u8 = 26;
         const ITERATIONS_HOST: u8 = 27;
@@ -4217,6 +5587,81 @@ impl A64Emitter {
         let generic_ptr_branch = self.emit_patchable_branch("b.eq .generic_trace_loop".to_string());
 
         let mut side_exits = Vec::new();
+        let mut vector_zero_branches = Vec::new();
+        let mut vector_tail_branches = Vec::new();
+        if region.width_bytes == 1 {
+            self.emit(
+                cmp_imm(ITERATIONS_HOST, NEON_CHUNK_BYTES),
+                format!("cmp x{ITERATIONS_HOST}, #{NEON_CHUNK_BYTES} ; direct trace vector count"),
+            );
+            vector_tail_branches
+                .push(self.emit_patchable_branch("b.lo .direct_trace_load_scalar".to_string()));
+
+            let vector_loop = self.current_offset();
+            self.emit(
+                ldr_q(NEON_ZERO_VECTOR, READ_PTR_HOST, 0),
+                format!("ldr q{NEON_ZERO_VECTOR}, [x{READ_PTR_HOST}] ; direct trace vector load"),
+            );
+            self.emit(
+                cmeq_zero_16b(NEON_ZERO_VECTOR, NEON_ZERO_VECTOR),
+                format!(
+                    "cmeq v{NEON_ZERO_VECTOR}.16b, v{NEON_ZERO_VECTOR}.16b, #0 ; direct trace vector zero mask"
+                ),
+            );
+            self.emit(
+                umaxv_b(NEON_ZERO_VECTOR, NEON_ZERO_VECTOR),
+                format!(
+                    "umaxv b{NEON_ZERO_VECTOR}, v{NEON_ZERO_VECTOR}.16b ; direct trace any zero"
+                ),
+            );
+            self.emit(
+                umov_w_from_b_lane0(SCRATCH2, NEON_ZERO_VECTOR),
+                format!(
+                    "umov w{SCRATCH2}, v{NEON_ZERO_VECTOR}.b[0] ; direct trace vector zero flag"
+                ),
+            );
+            self.emit(
+                cmp_reg32(SCRATCH2, A64_ZERO_REGISTER),
+                format!("cmp w{SCRATCH2}, wzr ; direct trace vector zero guard"),
+            );
+            let vector_zero_branch =
+                self.emit_patchable_branch("b.ne .direct_trace_load_tail".to_string());
+            vector_zero_branches.push(vector_zero_branch);
+            self.emit_direct_unsigned_load(
+                loaded_host,
+                READ_PTR_HOST,
+                NEON_CHUNK_BYTES - 1,
+                region.width_bytes,
+                "direct trace vector final load".to_string(),
+            );
+            self.emit_host_add_sub_imm_any(
+                READ_PTR_HOST,
+                READ_PTR_HOST,
+                i64::from(NEON_CHUNK_BYTES),
+            );
+            self.emit(
+                subs_imm(ITERATIONS_HOST, ITERATIONS_HOST, NEON_CHUNK_BYTES),
+                format!(
+                    "subs x{ITERATIONS_HOST}, x{ITERATIONS_HOST}, #{NEON_CHUNK_BYTES} ; direct trace vector count"
+                ),
+            );
+            self.emit(
+                cmp_imm(ITERATIONS_HOST, NEON_CHUNK_BYTES),
+                format!(
+                    "cmp x{ITERATIONS_HOST}, #{NEON_CHUNK_BYTES} ; direct trace vector loop guard"
+                ),
+            );
+            let vector_loop_branch = self.current_offset();
+            self.emit(
+                b_cond(vector_loop_branch, vector_loop, A64Cond::Hs),
+                "b.hs .direct_trace_load_vector_loop".to_string(),
+            );
+        }
+
+        let scalar_offset = self.current_offset();
+        for branch in vector_tail_branches {
+            self.patch_branch(branch, b_cond(branch, scalar_offset, A64Cond::Lo));
+        }
         self.emit(
             cmp_imm(ITERATIONS_HOST, UNROLLED_LOADS),
             format!("cmp x{ITERATIONS_HOST}, #{UNROLLED_LOADS} ; direct trace unroll count"),
@@ -4261,6 +5706,9 @@ impl A64Emitter {
         );
 
         let tail_offset = self.current_offset();
+        for branch in vector_zero_branches {
+            self.patch_branch(branch, b_cond(branch, tail_offset, A64Cond::Ne));
+        }
         self.patch_branch(tail_branch, b_cond(tail_branch, tail_offset, A64Cond::Lo));
         self.emit(
             cmp_reg(ITERATIONS_HOST, A64_ZERO_REGISTER),
@@ -4446,7 +5894,12 @@ impl A64Emitter {
     }
 
     fn emit_register_allocated_block(&mut self, block_plan: &RegisterAllocatedBlock<'_>) {
-        self.emit_leaf_prologue(false);
+        let may_call_runtime = !block_plan.memory_slow_path_preserve_hosts.is_empty();
+        if may_call_runtime {
+            self.emit_prologue(false);
+        } else {
+            self.emit_leaf_prologue(false);
+        }
 
         for (guest, host) in &block_plan.loaded_registers {
             self.load_guest_register(*host, *guest);
@@ -4462,7 +5915,11 @@ impl A64Emitter {
         }
 
         self.mov_imm64(0, block_plan.guest_instruction_count);
-        self.emit_leaf_epilogue(false);
+        if may_call_runtime {
+            self.emit_epilogue(false);
+        } else {
+            self.emit_leaf_epilogue(false);
+        }
         self.ret();
     }
 
@@ -4482,6 +5939,8 @@ impl A64Emitter {
             guest_to_host: trace_loop.guest_to_host,
             loaded_registers: Vec::new(),
             dirty_registers: Vec::new(),
+            memory_slow_path_preserve_hosts: Vec::new(),
+            memory_slow_path_cache_entries: JIT_FAST_CACHE_ENTRIES,
             guest_instruction_count: trace_loop.loop_guard.guest_instruction_count,
         };
         self.emit_loop_instruction(instruction, &loop_plan);
@@ -4694,6 +6153,8 @@ impl A64Emitter {
             guest_to_host: block_plan.guest_to_host,
             loaded_registers: Vec::new(),
             dirty_registers: Vec::new(),
+            memory_slow_path_preserve_hosts: block_plan.memory_slow_path_preserve_hosts.clone(),
+            memory_slow_path_cache_entries: block_plan.memory_slow_path_cache_entries,
             guest_instruction_count: block_plan.guest_instruction_count,
         };
         self.emit_loop_instruction(instruction, &loop_plan);
@@ -4851,6 +6312,12 @@ impl A64Emitter {
             NativeInstruction::Slli { rd, rs1, shamt } => {
                 self.emit_loop_shift_imm(rd, rs1, shamt, loop_plan, ShiftImmediateKind::Lsl)
             }
+            NativeInstruction::ShiftedWordOr {
+                rd,
+                rs1,
+                left_shamt,
+                right_shamt,
+            } => self.emit_loop_shifted_word_or(rd, rs1, left_shamt, right_shamt, loop_plan),
             NativeInstruction::Slliw { rd, rs1, shamt } => {
                 self.emit_loop_shift_imm32(rd, rs1, shamt, loop_plan, ShiftImmediateKind::Lsl)
             }
@@ -4919,65 +6386,55 @@ impl A64Emitter {
     }
 
     fn emit_prologue(&mut self, preserve_dynamic_count: bool) {
-        self.emit(
-            stp_pre(29, 30, 31, -16),
-            "stp x29, x30, [sp, #-16]!".to_string(),
-        );
-        self.emit(
-            stp_pre(CPU_PTR, REG_PTR, 31, -16),
-            format!("stp x{CPU_PTR}, x{REG_PTR}, [sp, #-16]!"),
-        );
+        self.emit_static(stp_pre(29, 30, 31, -16), "stp x29, x30, [sp, #-16]!");
+        self.emit_fmt(stp_pre(CPU_PTR, REG_PTR, 31, -16), || {
+            format!("stp x{CPU_PTR}, x{REG_PTR}, [sp, #-16]!")
+        });
         if preserve_dynamic_count {
-            self.emit(
-                stp_pre(DYNAMIC_INSTRUCTION_COUNT, 22, 31, -16),
-                format!("stp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp, #-16]!"),
+            self.emit_fmt(stp_pre(DYNAMIC_INSTRUCTION_COUNT, 22, 31, -16), || {
+                format!("stp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp, #-16]!")
+            });
+            self.emit_static(stp_pre(23, 24, 31, -16), "stp x23, x24, [sp, #-16]!");
+            self.emit_static(stp_pre(25, 26, 31, -16), "stp x25, x26, [sp, #-16]!");
+            self.emit_static(stp_pre(27, 28, 31, -16), "stp x27, x28, [sp, #-16]!");
+        } else if self.preload_fast_cache {
+            self.emit_static(
+                stp_pre(FAST_CACHE_START, FAST_CACHE_END, 31, -16),
+                "stp x22, x23, [sp, #-16]! ; fast cache save",
             );
-            self.emit(
-                stp_pre(23, 24, 31, -16),
-                "stp x23, x24, [sp, #-16]!".to_string(),
-            );
-            self.emit(
-                stp_pre(25, 26, 31, -16),
-                "stp x25, x26, [sp, #-16]!".to_string(),
-            );
-            self.emit(
-                stp_pre(27, 28, 31, -16),
-                "stp x27, x28, [sp, #-16]!".to_string(),
+            self.emit_static(
+                stp_pre(FAST_CACHE_READ_PTR, FAST_CACHE_WRITE_PTR, 31, -16),
+                "stp x24, x25, [sp, #-16]! ; fast cache save",
             );
         }
-        self.emit(add_imm(29, 31, 0), "mov x29, sp".to_string());
-        self.emit(mov_reg(CPU_PTR, 0), format!("mov x{CPU_PTR}, x0"));
-        self.emit(mov_reg(REG_PTR, 1), format!("mov x{REG_PTR}, x1"));
+        self.emit_static(add_imm(29, 31, 0), "mov x29, sp");
+        self.emit_fmt(mov_reg(CPU_PTR, 0), || format!("mov x{CPU_PTR}, x0"));
+        self.emit_fmt(mov_reg(REG_PTR, 1), || format!("mov x{REG_PTR}, x1"));
+        if self.preload_fast_cache {
+            self.emit_preload_fast_cache();
+        }
     }
 
     fn emit_leaf_prologue(&mut self, preserve_dynamic_count: bool) {
-        self.emit(
-            stp_pre(CPU_PTR, REG_PTR, 31, -16),
-            format!("stp x{CPU_PTR}, x{REG_PTR}, [sp, #-16]!"),
-        );
+        self.emit_static(stp_pre(29, 30, 31, -16), "stp x29, x30, [sp, #-16]!");
+        self.emit_fmt(stp_pre(CPU_PTR, REG_PTR, 31, -16), || {
+            format!("stp x{CPU_PTR}, x{REG_PTR}, [sp, #-16]!")
+        });
         if preserve_dynamic_count {
-            self.emit(
-                stp_pre(DYNAMIC_INSTRUCTION_COUNT, 22, 31, -16),
-                format!("stp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp, #-16]!"),
-            );
-            self.emit(
-                stp_pre(23, 24, 31, -16),
-                "stp x23, x24, [sp, #-16]!".to_string(),
-            );
-            self.emit(
-                stp_pre(25, 26, 31, -16),
-                "stp x25, x26, [sp, #-16]!".to_string(),
-            );
-            self.emit(
-                stp_pre(27, 28, 31, -16),
-                "stp x27, x28, [sp, #-16]!".to_string(),
-            );
+            self.emit_fmt(stp_pre(DYNAMIC_INSTRUCTION_COUNT, 22, 31, -16), || {
+                format!("stp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp, #-16]!")
+            });
+            self.emit_static(stp_pre(23, 24, 31, -16), "stp x23, x24, [sp, #-16]!");
+            self.emit_static(stp_pre(25, 26, 31, -16), "stp x25, x26, [sp, #-16]!");
+            self.emit_static(stp_pre(27, 28, 31, -16), "stp x27, x28, [sp, #-16]!");
         }
-        self.emit(mov_reg(CPU_PTR, 0), format!("mov x{CPU_PTR}, x0"));
-        self.emit(mov_reg(REG_PTR, 1), format!("mov x{REG_PTR}, x1"));
+        self.emit_static(add_imm(29, 31, 0), "mov x29, sp");
+        self.emit_fmt(mov_reg(CPU_PTR, 0), || format!("mov x{CPU_PTR}, x0"));
+        self.emit_fmt(mov_reg(REG_PTR, 1), || format!("mov x{REG_PTR}, x1"));
     }
 
     fn emit_selective_leaf_prologue(&mut self, registers: &[u8]) {
+        self.emit_static(stp_pre(29, 30, 31, -16), "stp x29, x30, [sp, #-16]!");
         for pair in registers.chunks(2) {
             let first = pair[0];
             let second = pair.get(1).copied().unwrap_or(A64_ZERO_REGISTER);
@@ -4989,9 +6446,74 @@ impl A64Emitter {
                 ),
             );
         }
+        self.emit_static(add_imm(29, 31, 0), "mov x29, sp");
     }
 
     fn emit_epilogue(&mut self, restore_dynamic_count: bool) {
+        if restore_dynamic_count {
+            self.emit(
+                ldp_post(27, 28, 31, 16),
+                "ldp x27, x28, [sp], #16".to_string(),
+            );
+            self.emit(
+                ldp_post(25, 26, 31, 16),
+                "ldp x25, x26, [sp], #16".to_string(),
+            );
+            self.emit(
+                ldp_post(23, 24, 31, 16),
+                "ldp x23, x24, [sp], #16".to_string(),
+            );
+            self.emit(
+                ldp_post(DYNAMIC_INSTRUCTION_COUNT, 22, 31, 16),
+                format!("ldp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp], #16"),
+            );
+        } else if self.preload_fast_cache {
+            self.emit(
+                ldp_post(FAST_CACHE_READ_PTR, FAST_CACHE_WRITE_PTR, 31, 16),
+                "ldp x24, x25, [sp], #16 ; fast cache restore".to_string(),
+            );
+            self.emit(
+                ldp_post(FAST_CACHE_START, FAST_CACHE_END, 31, 16),
+                "ldp x22, x23, [sp], #16 ; fast cache restore".to_string(),
+            );
+        }
+        self.emit(
+            ldp_post(CPU_PTR, REG_PTR, 31, 16),
+            format!("ldp x{CPU_PTR}, x{REG_PTR}, [sp], #16"),
+        );
+        self.emit(
+            ldp_post(29, 30, 31, 16),
+            "ldp x29, x30, [sp], #16".to_string(),
+        );
+    }
+
+    fn emit_preload_fast_cache(&mut self) {
+        let start_offset = jit_fast_cache_field_offset(0, JIT_FAST_CACHE_START_OFFSET);
+        let end_offset = jit_fast_cache_field_offset(0, JIT_FAST_CACHE_END_OFFSET);
+        let read_ptr_offset = jit_fast_cache_field_offset(0, JIT_FAST_CACHE_READ_PTR_OFFSET);
+        let write_ptr_offset = jit_fast_cache_field_offset(0, JIT_FAST_CACHE_WRITE_PTR_OFFSET);
+
+        self.emit_fmt(ldr_u64(FAST_CACHE_START, CPU_PTR, start_offset), || {
+            format!(
+                "ldr x{FAST_CACHE_START}, [x{CPU_PTR}, #{start_offset}] ; preload fast cache start"
+            )
+        });
+        self.emit_fmt(ldr_u64(FAST_CACHE_END, CPU_PTR, end_offset), || {
+            format!("ldr x{FAST_CACHE_END}, [x{CPU_PTR}, #{end_offset}] ; preload fast cache end")
+        });
+        self.emit_fmt(ldr_u64(FAST_CACHE_READ_PTR, CPU_PTR, read_ptr_offset), || {
+            format!(
+                "ldr x{FAST_CACHE_READ_PTR}, [x{CPU_PTR}, #{read_ptr_offset}] ; preload fast cache read ptr"
+            )
+        });
+        self.emit_fmt(ldr_u64(FAST_CACHE_WRITE_PTR, CPU_PTR, write_ptr_offset), || {
+            format!(
+                "ldr x{FAST_CACHE_WRITE_PTR}, [x{CPU_PTR}, #{write_ptr_offset}] ; preload fast cache write ptr"
+            )
+        });
+    }
+
+    fn emit_leaf_epilogue(&mut self, restore_dynamic_count: bool) {
         if restore_dynamic_count {
             self.emit(
                 ldp_post(27, 28, 31, 16),
@@ -5020,31 +6542,6 @@ impl A64Emitter {
         );
     }
 
-    fn emit_leaf_epilogue(&mut self, restore_dynamic_count: bool) {
-        if restore_dynamic_count {
-            self.emit(
-                ldp_post(27, 28, 31, 16),
-                "ldp x27, x28, [sp], #16".to_string(),
-            );
-            self.emit(
-                ldp_post(25, 26, 31, 16),
-                "ldp x25, x26, [sp], #16".to_string(),
-            );
-            self.emit(
-                ldp_post(23, 24, 31, 16),
-                "ldp x23, x24, [sp], #16".to_string(),
-            );
-            self.emit(
-                ldp_post(DYNAMIC_INSTRUCTION_COUNT, 22, 31, 16),
-                format!("ldp x{DYNAMIC_INSTRUCTION_COUNT}, x22, [sp], #16"),
-            );
-        }
-        self.emit(
-            ldp_post(CPU_PTR, REG_PTR, 31, 16),
-            format!("ldp x{CPU_PTR}, x{REG_PTR}, [sp], #16"),
-        );
-    }
-
     fn emit_selective_leaf_epilogue(&mut self, registers: &[u8]) {
         for pair in registers.chunks(2).rev() {
             let first = pair[0];
@@ -5057,6 +6554,10 @@ impl A64Emitter {
                 ),
             );
         }
+        self.emit(
+            ldp_post(29, 30, 31, 16),
+            "ldp x29, x30, [sp], #16".to_string(),
+        );
     }
 
     fn store_pc(&mut self, pc: u64) {
@@ -5127,6 +6628,7 @@ impl A64Emitter {
     }
 
     fn emit_ecall(&mut self, next_pc: u64) {
+        self.store_pc(next_pc.wrapping_sub(4));
         self.emit(
             mov_reg(0, CPU_PTR),
             format!("mov x0, x{CPU_PTR} ; ecall cpu"),
@@ -5267,13 +6769,17 @@ impl A64Emitter {
         let (target, name) = jit_load_runtime(width, signed);
         self.load_guest_register(SCRATCH0, rs1);
         self.emit_host_add_sub_imm_or_move(SCRATCH0, SCRATCH0, imm);
-        self.emit(
-            mov_reg(0, CPU_PTR),
-            format!("mov x0, x{CPU_PTR} ; load cpu"),
+        self.emit_fast_memory_load(
+            Some(rd),
+            None,
+            SCRATCH0,
+            width,
+            signed,
+            target,
+            name,
+            &[],
+            JIT_FAST_CACHE_ENTRIES,
         );
-        self.emit(mov_reg(1, SCRATCH0), format!("mov x1, x{SCRATCH0} ; addr"));
-        self.emit_call(target, name);
-        self.store_guest_register(rd, 0);
     }
 
     fn emit_store(&mut self, rs1: u8, rs2: u8, imm: i64, width: u64) {
@@ -5281,13 +6787,472 @@ impl A64Emitter {
         self.load_guest_register(SCRATCH0, rs1);
         self.emit_host_add_sub_imm_or_move(SCRATCH0, SCRATCH0, imm);
         let value = self.load_guest_register_or_zero(SCRATCH1, rs2);
-        self.emit(
-            mov_reg(0, CPU_PTR),
-            format!("mov x0, x{CPU_PTR} ; store cpu"),
+        self.emit_fast_memory_store(SCRATCH0, value, width, target, name, &[]);
+    }
+
+    fn emit_byte_copy8(
+        &mut self,
+        registers: [u8; 8],
+        load_base: u8,
+        load_imm: i64,
+        store_base: u8,
+        store_imm: i64,
+    ) {
+        let (load_target, load_name) = jit_load_runtime(8, false);
+        self.load_guest_register(SCRATCH0, load_base);
+        self.emit_host_add_sub_imm_or_move(SCRATCH0, SCRATCH0, load_imm);
+        self.emit_fast_memory_load(
+            None,
+            Some(LOOP_TEMP),
+            SCRATCH0,
+            8,
+            false,
+            load_target,
+            load_name,
+            &[],
+            JIT_FAST_CACHE_ENTRIES,
         );
-        self.emit(mov_reg(1, SCRATCH0), format!("mov x1, x{SCRATCH0} ; addr"));
-        self.emit(mov_reg(2, value), format!("mov x2, x{value} ; value"));
-        self.emit_call(target, name);
+
+        for (byte_index, register) in registers.into_iter().enumerate() {
+            if register == 0 {
+                continue;
+            }
+            let lsb = (byte_index as u32) * 8;
+            self.emit(
+                ubfm64(SCRATCH0, LOOP_TEMP, lsb, lsb + 7),
+                format!("ubfx x{SCRATCH0}, x{LOOP_TEMP}, #{lsb}, #8 ; byte-copy8 x{register}"),
+            );
+            self.store_guest_register(register, SCRATCH0);
+        }
+
+        let (store_target, store_name) = jit_store_runtime(8);
+        self.load_guest_register(SCRATCH0, store_base);
+        self.emit_host_add_sub_imm_or_move(SCRATCH0, SCRATCH0, store_imm);
+        self.emit_fast_memory_store(SCRATCH0, LOOP_TEMP, 8, store_target, store_name, &[]);
+    }
+
+    fn emit_fast_memory_load(
+        &mut self,
+        guest_rd: Option<u8>,
+        host_dst: Option<u8>,
+        addr_host: u8,
+        width: u64,
+        signed: bool,
+        runtime_target: u64,
+        runtime_name: &'static str,
+        preserve_hosts: &[u8],
+        cache_entries: usize,
+    ) {
+        debug_assert!(matches!(width, 1 | 2 | 4 | 8));
+        debug_assert!((1..=JIT_FAST_CACHE_ENTRIES).contains(&cache_entries));
+
+        debug_assert_ne!(addr_host, SCRATCH1);
+        debug_assert_ne!(addr_host, SCRATCH2);
+        debug_assert_ne!(addr_host, SCRATCH3);
+
+        let mut slow_branches = Vec::with_capacity(3);
+
+        if width != 1 {
+            self.emit_fmt(add_imm(SCRATCH1, addr_host, width as u16), || {
+                format!("add x{SCRATCH1}, x{addr_host}, #{width} ; fast load end")
+            });
+            self.emit_fmt(cmp_reg(SCRATCH1, addr_host), || {
+                format!("cmp x{SCRATCH1}, x{addr_host} ; fast load overflow")
+            });
+            slow_branches.push((
+                self.emit_patchable_branch("b.lo .jit_load_slow".to_string()),
+                A64Cond::Lo,
+            ));
+        }
+
+        slow_branches.extend(
+            self.emit_fast_memory_load_cache_entry(0, guest_rd, host_dst, addr_host, width, signed),
+        );
+
+        self.memory_slow_paths.push(MemorySlowPath::Load {
+            branches: slow_branches,
+            continuation: self.current_offset(),
+            guest_rd,
+            host_dst,
+            addr_host,
+            width,
+            signed,
+            runtime_target,
+            runtime_name,
+            preserve_hosts: memory_slow_path_preserve_hosts(preserve_hosts, host_dst),
+            cache_entries,
+        });
+    }
+
+    fn emit_fast_memory_load_slow_path(
+        &mut self,
+        branches: Vec<(usize, A64Cond)>,
+        continuation: usize,
+        guest_rd: Option<u8>,
+        host_dst: Option<u8>,
+        addr_host: u8,
+        width: u64,
+        signed: bool,
+        runtime_target: u64,
+        runtime_name: &'static str,
+        preserve_hosts: Vec<u8>,
+        cache_entries: usize,
+    ) {
+        let fallback_offset = self.current_offset();
+        for (branch, condition) in branches {
+            self.patch_branch(branch, b_cond(branch, fallback_offset, condition));
+        }
+
+        let mut runtime_branches = Vec::with_capacity(1);
+        if width != 1 {
+            self.emit_fmt(add_imm(SCRATCH1, addr_host, width as u16), || {
+                format!("add x{SCRATCH1}, x{addr_host}, #{width} ; cold fast load end")
+            });
+            self.emit_fmt(cmp_reg(SCRATCH1, addr_host), || {
+                format!("cmp x{SCRATCH1}, x{addr_host} ; cold fast load overflow")
+            });
+            runtime_branches.push((
+                self.emit_patchable_branch("b.lo .jit_load_runtime".to_string()),
+                A64Cond::Lo,
+            ));
+        }
+
+        for entry in 1..cache_entries {
+            let next_entry_branches = self.emit_fast_memory_load_cache_entry(
+                entry, guest_rd, host_dst, addr_host, width, signed,
+            );
+            self.emit_branch_to_offset(continuation, "b .jit_load_continue");
+
+            let next_entry_offset = self.current_offset();
+            for (branch, condition) in next_entry_branches {
+                self.patch_branch(branch, b_cond(branch, next_entry_offset, condition));
+            }
+        }
+
+        let runtime_offset = self.current_offset();
+        for (branch, condition) in runtime_branches {
+            self.patch_branch(branch, b_cond(branch, runtime_offset, condition));
+        }
+        self.emit_fmt(mov_reg(0, CPU_PTR), || {
+            format!("mov x0, x{CPU_PTR} ; load cpu")
+        });
+        self.emit_host_move(1, addr_host, " ; addr");
+        let preserved_hosts =
+            self.emit_push_host_registers(&preserve_hosts, "memory load slow path preserve");
+        self.emit_call(runtime_target, runtime_name);
+        self.emit_pop_host_registers(&preserved_hosts, "memory load slow path restore");
+        self.emit_fast_load_result(guest_rd, host_dst);
+        self.emit_branch_to_offset(continuation, "b .jit_load_continue");
+    }
+
+    fn emit_fast_memory_load_cache_entry(
+        &mut self,
+        entry: usize,
+        guest_rd: Option<u8>,
+        host_dst: Option<u8>,
+        addr_host: u8,
+        width: u64,
+        signed: bool,
+    ) -> Vec<(usize, A64Cond)> {
+        let start_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_START_OFFSET);
+        let end_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_END_OFFSET);
+        let read_ptr_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_READ_PTR_OFFSET);
+        let mut next_entry_branches = Vec::with_capacity(2);
+        let preloaded_entry = self.preload_fast_cache && entry == 0;
+        let (start_reg, end_reg) = if preloaded_entry {
+            (FAST_CACHE_START, FAST_CACHE_END)
+        } else {
+            self.emit_fmt(ldr_u64(SCRATCH2, CPU_PTR, start_offset), || {
+                format!(
+                    "ldr x{SCRATCH2}, [x{CPU_PTR}, #{start_offset}] ; fast load cache {entry} start"
+                )
+            });
+            self.emit_fmt(ldr_u64(SCRATCH3, CPU_PTR, end_offset), || {
+                format!(
+                    "ldr x{SCRATCH3}, [x{CPU_PTR}, #{end_offset}] ; fast load cache {entry} end"
+                )
+            });
+            (SCRATCH2, SCRATCH3)
+        };
+
+        self.emit_fmt(cmp_reg(addr_host, start_reg), || {
+            format!("cmp x{addr_host}, x{start_reg} ; fast load cache {entry} lower bound")
+        });
+        next_entry_branches.push((
+            self.emit_patchable_branch("b.lo .jit_load_next_cache".to_string()),
+            A64Cond::Lo,
+        ));
+        if width == 1 {
+            self.emit_fmt(cmp_reg(addr_host, end_reg), || {
+                format!("cmp x{addr_host}, x{end_reg} ; fast load cache {entry} upper bound")
+            });
+        } else {
+            self.emit_fmt(cmp_reg(end_reg, SCRATCH1), || {
+                format!("cmp x{end_reg}, x{SCRATCH1} ; fast load cache {entry} upper bound")
+            });
+        }
+        let (upper_bound_branch, upper_bound_condition) = if width == 1 {
+            ("b.hs .jit_load_next_cache", A64Cond::Hs)
+        } else {
+            ("b.lo .jit_load_next_cache", A64Cond::Lo)
+        };
+        next_entry_branches.push((
+            self.emit_patchable_branch(upper_bound_branch.to_string()),
+            upper_bound_condition,
+        ));
+        if preloaded_entry {
+            self.emit_host_move(SCRATCH1, FAST_CACHE_READ_PTR, " ; fast load cache host ptr");
+        } else {
+            self.emit_fmt(ldr_u64(SCRATCH1, CPU_PTR, read_ptr_offset), || {
+                format!(
+                    "ldr x{SCRATCH1}, [x{CPU_PTR}, #{read_ptr_offset}] ; fast load cache {entry} host ptr"
+                )
+            });
+        }
+        self.emit_fmt(sub_reg(SCRATCH0, addr_host, start_reg), || {
+            format!("sub x{SCRATCH0}, x{addr_host}, x{start_reg} ; fast load offset")
+        });
+        self.emit_fast_load_value(width, signed);
+        self.emit_fast_load_result(guest_rd, host_dst);
+        next_entry_branches
+    }
+
+    fn emit_branch_to_offset(&mut self, target: usize, text: &str) {
+        let branch_offset = self.current_offset();
+        self.emit(b_uncond(branch_offset, target), text.to_string());
+    }
+
+    fn emit_push_host_registers(&mut self, hosts: &[u8], reason: &str) -> Vec<(u8, u8)> {
+        let mut pairs = Vec::new();
+        for chunk in hosts.chunks(2) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(SCRATCH0);
+            self.emit(
+                stp_pre(first, second, 31, -16),
+                format!(
+                    "stp {}, {}, [sp, #-16]! ; {reason}",
+                    host_register_name(first),
+                    host_register_name(second)
+                ),
+            );
+            pairs.push((first, second));
+        }
+        pairs
+    }
+
+    fn emit_pop_host_registers(&mut self, pairs: &[(u8, u8)], reason: &str) {
+        for &(first, second) in pairs.iter().rev() {
+            self.emit(
+                ldp_post(first, second, 31, 16),
+                format!(
+                    "ldp {}, {}, [sp], #16 ; {reason}",
+                    host_register_name(first),
+                    host_register_name(second)
+                ),
+            );
+        }
+    }
+
+    fn emit_fast_load_result(&mut self, guest_rd: Option<u8>, host_dst: Option<u8>) {
+        if let Some(dst) = host_dst {
+            self.emit_host_move(dst, 0, " ; regalloc load result");
+        }
+        if let Some(rd) = guest_rd {
+            self.store_guest_register(rd, 0);
+        }
+    }
+
+    fn emit_fast_load_value(&mut self, width: u64, signed: bool) {
+        match width {
+            1 => {
+                self.emit_static(
+                    ldr_u8_reg(0, SCRATCH1, SCRATCH0),
+                    "ldrb w0, [x10, x9] ; fast load u8",
+                );
+                if signed {
+                    self.emit_static(sbfm64(0, 0, 0, 7), "sxtb x0, w0 ; fast load i8");
+                }
+            }
+            2 => {
+                self.emit_static(
+                    ldr_u16_reg(0, SCRATCH1, SCRATCH0),
+                    "ldrh w0, [x10, x9] ; fast load u16",
+                );
+                if signed {
+                    self.emit_static(sbfm64(0, 0, 0, 15), "sxth x0, w0 ; fast load i16");
+                }
+            }
+            4 => {
+                self.emit_static(
+                    ldr_u32_reg(0, SCRATCH1, SCRATCH0),
+                    "ldr w0, [x10, x9] ; fast load u32",
+                );
+                if signed {
+                    self.sign_extend_word(0, 0);
+                }
+            }
+            8 => self.emit_static(
+                ldr_u64_reg(0, SCRATCH1, SCRATCH0),
+                "ldr x0, [x10, x9] ; fast load u64",
+            ),
+            _ => unreachable!("invalid fast memory load width"),
+        }
+    }
+
+    fn emit_fast_memory_store(
+        &mut self,
+        addr_host: u8,
+        value_host: u8,
+        width: u64,
+        runtime_target: u64,
+        runtime_name: &'static str,
+        preserve_hosts: &[u8],
+    ) {
+        debug_assert!(matches!(width, 1 | 2 | 4 | 8));
+
+        debug_assert_ne!(addr_host, SCRATCH1);
+        debug_assert_ne!(addr_host, SCRATCH2);
+        debug_assert_ne!(addr_host, SCRATCH3);
+
+        let mut fallback_branches = Vec::with_capacity(JIT_FAST_CACHE_ENTRIES + 1);
+        let mut done_branches = Vec::with_capacity(JIT_FAST_CACHE_ENTRIES);
+
+        self.emit_host_move(2, value_host, " ; fast store value");
+        if width != 1 {
+            self.emit_fmt(add_imm(SCRATCH2, addr_host, width as u16), || {
+                format!("add x{SCRATCH2}, x{addr_host}, #{width} ; fast store end")
+            });
+            self.emit_fmt(cmp_reg(SCRATCH2, addr_host), || {
+                format!("cmp x{SCRATCH2}, x{addr_host} ; fast store overflow")
+            });
+            fallback_branches.push((
+                self.emit_patchable_branch("b.lo .jit_store_slow".to_string()),
+                A64Cond::Lo,
+            ));
+        }
+
+        for entry in 0..JIT_FAST_CACHE_ENTRIES {
+            let start_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_START_OFFSET);
+            let end_offset = jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_END_OFFSET);
+            let write_ptr_offset =
+                jit_fast_cache_field_offset(entry, JIT_FAST_CACHE_WRITE_PTR_OFFSET);
+            let mut next_entry_branches = Vec::with_capacity(3);
+            let preloaded_entry = self.preload_fast_cache && entry == 0;
+            let (start_reg, end_reg) = if preloaded_entry {
+                (FAST_CACHE_START, FAST_CACHE_END)
+            } else {
+                self.emit_fmt(ldr_u64(SCRATCH3, CPU_PTR, start_offset), || {
+                    format!(
+                        "ldr x{SCRATCH3}, [x{CPU_PTR}, #{start_offset}] ; fast store cache {entry} start"
+                    )
+                });
+                self.emit_fmt(ldr_u64(SCRATCH1, CPU_PTR, end_offset), || {
+                    format!(
+                        "ldr x{SCRATCH1}, [x{CPU_PTR}, #{end_offset}] ; fast store cache {entry} end"
+                    )
+                });
+                (SCRATCH3, SCRATCH1)
+            };
+
+            self.emit_fmt(cmp_reg(addr_host, start_reg), || {
+                format!("cmp x{addr_host}, x{start_reg} ; fast store cache {entry} lower bound")
+            });
+            next_entry_branches.push((
+                self.emit_patchable_branch("b.lo .jit_store_next_cache".to_string()),
+                A64Cond::Lo,
+            ));
+            if width == 1 {
+                self.emit_fmt(cmp_reg(addr_host, end_reg), || {
+                    format!("cmp x{addr_host}, x{end_reg} ; fast store cache {entry} upper bound")
+                });
+            } else {
+                self.emit_fmt(cmp_reg(end_reg, SCRATCH2), || {
+                    format!("cmp x{end_reg}, x{SCRATCH2} ; fast store cache {entry} upper bound")
+                });
+            }
+            let (upper_bound_branch, upper_bound_condition) = if width == 1 {
+                ("b.hs .jit_store_next_cache", A64Cond::Hs)
+            } else {
+                ("b.lo .jit_store_next_cache", A64Cond::Lo)
+            };
+            next_entry_branches.push((
+                self.emit_patchable_branch(upper_bound_branch.to_string()),
+                upper_bound_condition,
+            ));
+            if preloaded_entry {
+                self.emit_host_move(
+                    SCRATCH1,
+                    FAST_CACHE_WRITE_PTR,
+                    " ; fast store cache host ptr",
+                );
+            } else {
+                self.emit_fmt(ldr_u64(SCRATCH1, CPU_PTR, write_ptr_offset), || {
+                    format!(
+                        "ldr x{SCRATCH1}, [x{CPU_PTR}, #{write_ptr_offset}] ; fast store cache {entry} host ptr"
+                    )
+                });
+            }
+            self.emit_static(
+                cmp_reg(SCRATCH1, A64_ZERO_REGISTER),
+                "cmp x10, xzr ; fast store ptr",
+            );
+            fallback_branches.push((
+                self.emit_patchable_branch("b.eq .jit_store_slow".to_string()),
+                A64Cond::Eq,
+            ));
+            self.emit_fmt(sub_reg(SCRATCH0, addr_host, start_reg), || {
+                format!("sub x{SCRATCH0}, x{addr_host}, x{start_reg} ; fast store offset")
+            });
+            self.emit_fast_store_value(width);
+            done_branches.push(self.emit_patchable_branch("b .jit_store_done".to_string()));
+
+            let next_entry_offset = self.current_offset();
+            for (branch, condition) in next_entry_branches {
+                self.patch_branch(branch, b_cond(branch, next_entry_offset, condition));
+            }
+        }
+
+        let fallback_offset = self.current_offset();
+        for (branch, condition) in fallback_branches {
+            self.patch_branch(branch, b_cond(branch, fallback_offset, condition));
+        }
+        self.emit_fmt(mov_reg(0, CPU_PTR), || {
+            format!("mov x0, x{CPU_PTR} ; store cpu")
+        });
+        self.emit_host_move(1, addr_host, " ; addr");
+        let preserved_hosts = self.emit_push_host_registers(
+            &memory_slow_path_preserve_hosts(preserve_hosts, None),
+            "memory store slow path preserve",
+        );
+        self.emit_call(runtime_target, runtime_name);
+        self.emit_pop_host_registers(&preserved_hosts, "memory store slow path restore");
+
+        let done_offset = self.current_offset();
+        for branch in done_branches {
+            self.patch_branch(branch, b_uncond(branch, done_offset));
+        }
+    }
+
+    fn emit_fast_store_value(&mut self, width: u64) {
+        match width {
+            1 => self.emit_static(
+                str_u8_reg(2, SCRATCH1, SCRATCH0),
+                "strb w2, [x10, x9] ; fast store u8",
+            ),
+            2 => self.emit_static(
+                str_u16_reg(2, SCRATCH1, SCRATCH0),
+                "strh w2, [x10, x9] ; fast store u16",
+            ),
+            4 => self.emit_static(
+                str_u32_reg(2, SCRATCH1, SCRATCH0),
+                "str w2, [x10, x9] ; fast store u32",
+            ),
+            8 => self.emit_static(
+                str_u64_reg(2, SCRATCH1, SCRATCH0),
+                "str x2, [x10, x9] ; fast store u64",
+            ),
+            _ => unreachable!("invalid fast memory store width"),
+        }
     }
 
     fn emit_float_load(&mut self, rd: u8, rs1: u8, imm: i64, width: u64) {
@@ -5977,6 +7942,21 @@ impl A64Emitter {
         self.sign_extend_word(dst, dst);
     }
 
+    fn emit_loop_shifted_word_or(
+        &mut self,
+        rd: u8,
+        rs1: u8,
+        left_shamt: u32,
+        right_shamt: u32,
+        loop_plan: &RegisterAllocatedLoop<'_>,
+    ) {
+        let Some(dst) = loop_plan.host_for_write(rd) else {
+            return;
+        };
+        let src = loop_plan.host_or_zero(rs1);
+        self.emit_shifted_word_or_host(dst, src, left_shamt, right_shamt, " ; regalloc");
+    }
+
     fn emit_loop_compare_set_reg(
         &mut self,
         rd: u8,
@@ -6042,18 +8022,23 @@ impl A64Emitter {
     ) {
         let (target, name) = jit_load_runtime(width, signed);
         let base = loop_plan.host_or_zero(rs1);
-        self.emit_host_add_sub_imm_or_move(1, base, imm);
-        self.emit(
-            mov_reg(0, CPU_PTR),
-            format!("mov x0, x{CPU_PTR} ; regalloc load cpu"),
+        let addr = if imm == 0 {
+            base
+        } else {
+            self.emit_host_add_sub_imm_or_move(1, base, imm);
+            1
+        };
+        self.emit_fast_memory_load(
+            None,
+            loop_plan.host_for_write(rd),
+            addr,
+            width,
+            signed,
+            target,
+            name,
+            &loop_plan.memory_slow_path_preserve_hosts,
+            loop_plan.memory_slow_path_cache_entries,
         );
-        self.emit_call(target, name);
-        if let Some(dst) = loop_plan.host_for_write(rd) {
-            self.emit(
-                mov_reg(dst, 0),
-                format!("mov x{dst}, x0 ; regalloc load x{rd}"),
-            );
-        }
     }
 
     fn emit_loop_store(
@@ -6067,16 +8052,20 @@ impl A64Emitter {
         let (target, name) = jit_store_runtime(width);
         let base = loop_plan.host_or_zero(rs1);
         let value = loop_plan.host_or_zero(rs2);
-        self.emit_host_add_sub_imm_or_move(1, base, imm);
-        self.emit(
-            mov_reg(2, value),
-            format!("mov x2, x{value} ; regalloc store value"),
+        let addr = if imm == 0 {
+            base
+        } else {
+            self.emit_host_add_sub_imm_or_move(1, base, imm);
+            1
+        };
+        self.emit_fast_memory_store(
+            addr,
+            value,
+            width,
+            target,
+            name,
+            &loop_plan.memory_slow_path_preserve_hosts,
         );
-        self.emit(
-            mov_reg(0, CPU_PTR),
-            format!("mov x0, x{CPU_PTR} ; regalloc store cpu"),
-        );
-        self.emit_call(target, name);
     }
 
     fn emit_binary_reg(
@@ -6132,22 +8121,20 @@ impl A64Emitter {
 
     fn emit_host_add_sub_imm(&mut self, rd: u8, rn: u8, imm: i64) {
         if imm >= 0 {
-            self.emit(
-                add_imm(rd, rn, imm as u16),
-                format!("add x{rd}, x{rn}, #{}", imm),
-            );
+            self.emit_fmt(add_imm(rd, rn, imm as u16), || {
+                format!("add x{rd}, x{rn}, #{}", imm)
+            });
         } else {
-            self.emit(
-                sub_imm(rd, rn, (-imm) as u16),
-                format!("sub x{rd}, x{rn}, #{}", -imm),
-            );
+            self.emit_fmt(sub_imm(rd, rn, (-imm) as u16), || {
+                format!("sub x{rd}, x{rn}, #{}", -imm)
+            });
         }
     }
 
     fn emit_host_add_sub_imm_or_move(&mut self, rd: u8, rn: u8, imm: i64) {
         if imm == 0 {
             if rd != rn {
-                self.emit(mov_reg(rd, rn), format!("mov x{rd}, x{rn}"));
+                self.emit_fmt(mov_reg(rd, rn), || format!("mov x{rd}, x{rn}"));
             }
             return;
         }
@@ -6163,29 +8150,25 @@ impl A64Emitter {
 
         self.mov_imm64(LOOP_TEMP, imm.unsigned_abs());
         if imm >= 0 {
-            self.emit(
-                add_reg(rd, rn, LOOP_TEMP),
-                format!("add x{rd}, x{rn}, x{LOOP_TEMP}"),
-            );
+            self.emit_fmt(add_reg(rd, rn, LOOP_TEMP), || {
+                format!("add x{rd}, x{rn}, x{LOOP_TEMP}")
+            });
         } else {
-            self.emit(
-                sub_reg(rd, rn, LOOP_TEMP),
-                format!("sub x{rd}, x{rn}, x{LOOP_TEMP}"),
-            );
+            self.emit_fmt(sub_reg(rd, rn, LOOP_TEMP), || {
+                format!("sub x{rd}, x{rn}, x{LOOP_TEMP}")
+            });
         }
     }
 
     fn emit_host_add_sub_imm32(&mut self, rd: u8, rn: u8, imm: i64) {
         if imm >= 0 {
-            self.emit(
-                add_imm32(rd, rn, imm as u16),
-                format!("add w{rd}, w{rn}, #{}", imm),
-            );
+            self.emit_fmt(add_imm32(rd, rn, imm as u16), || {
+                format!("add w{rd}, w{rn}, #{}", imm)
+            });
         } else {
-            self.emit(
-                sub_imm32(rd, rn, (-imm) as u16),
-                format!("sub w{rd}, w{rn}, #{}", -imm),
-            );
+            self.emit_fmt(sub_imm32(rd, rn, (-imm) as u16), || {
+                format!("sub w{rd}, w{rn}, #{}", -imm)
+            });
         }
     }
 
@@ -6197,15 +8180,13 @@ impl A64Emitter {
 
         self.mov_imm64(LOOP_TEMP, imm.unsigned_abs());
         if imm >= 0 {
-            self.emit(
-                add_reg32(rd, rn, LOOP_TEMP),
-                format!("add w{rd}, w{rn}, w{LOOP_TEMP}"),
-            );
+            self.emit_fmt(add_reg32(rd, rn, LOOP_TEMP), || {
+                format!("add w{rd}, w{rn}, w{LOOP_TEMP}")
+            });
         } else {
-            self.emit(
-                sub_reg32(rd, rn, LOOP_TEMP),
-                format!("sub w{rd}, w{rn}, w{LOOP_TEMP}"),
-            );
+            self.emit_fmt(sub_reg32(rd, rn, LOOP_TEMP), || {
+                format!("sub w{rd}, w{rn}, w{LOOP_TEMP}")
+            });
         }
     }
 
@@ -6314,6 +8295,33 @@ impl A64Emitter {
         self.emit_shift_imm32_host(SCRATCH0, SCRATCH0, shamt, kind, "");
         self.sign_extend_word(SCRATCH0, SCRATCH0);
         self.store_guest_register(rd, SCRATCH0);
+    }
+
+    fn emit_shifted_word_or(&mut self, rd: u8, rs1: u8, left_shamt: u32, right_shamt: u32) {
+        if rd == 0 {
+            return;
+        }
+        let src = self.load_guest_register_or_zero(SCRATCH0, rs1);
+        self.emit_shifted_word_or_host(SCRATCH0, src, left_shamt, right_shamt, "");
+        self.store_guest_register(rd, SCRATCH0);
+    }
+
+    fn emit_shifted_word_or_host(
+        &mut self,
+        dst: u8,
+        src: u8,
+        left_shamt: u32,
+        right_shamt: u32,
+        suffix: &str,
+    ) {
+        debug_assert!((1..32).contains(&left_shamt));
+        debug_assert!((1..32).contains(&right_shamt));
+        debug_assert_eq!(left_shamt + right_shamt, 32);
+        self.emit_shift_imm32_host(LOOP_TEMP, src, right_shamt, ShiftImmediateKind::Lsr, suffix);
+        self.emit(
+            orr_lsl_imm(dst, LOOP_TEMP, src, left_shamt),
+            format!("orr x{dst}, x{LOOP_TEMP}, x{src}, lsl #{left_shamt}{suffix}"),
+        );
     }
 
     fn emit_shift_imm64_host(
@@ -6432,11 +8440,11 @@ impl A64Emitter {
     }
 
     fn sign_extend_word(&mut self, rd: u8, rn: u8) {
-        self.emit(sxtw(rd, rn), format!("sxtw x{rd}, w{rn}"));
+        self.emit_fmt(sxtw(rd, rn), || format!("sxtw x{rd}, w{rn}"));
     }
 
     fn zero_extend_word(&mut self, rd: u8, rn: u8) {
-        self.emit(ubfm64(rd, rn, 0, 31), format!("uxtw x{rd}, w{rn}"));
+        self.emit_fmt(ubfm64(rd, rn, 0, 31), || format!("uxtw x{rd}, w{rn}"));
     }
 
     fn load_guest_register(&mut self, host: u8, guest: u8) {
@@ -6445,17 +8453,15 @@ impl A64Emitter {
 
     fn load_guest_register_from(&mut self, host: u8, guest: u8, reg_ptr: u8) {
         if guest == 0 {
-            self.emit(
-                mov_reg(host, A64_ZERO_REGISTER),
-                format!("mov x{host}, xzr"),
-            );
+            self.emit_fmt(mov_reg(host, A64_ZERO_REGISTER), || {
+                format!("mov x{host}, xzr")
+            });
             return;
         }
         let offset = u16::from(guest) * 8;
-        self.emit(
-            ldr_u64(host, reg_ptr, offset),
-            format!("ldr x{host}, [x{reg_ptr}, #{offset}] ; load guest x{guest}"),
-        );
+        self.emit_fmt(ldr_u64(host, reg_ptr, offset), || {
+            format!("ldr x{host}, [x{reg_ptr}, #{offset}] ; load guest x{guest}")
+        });
     }
 
     fn load_guest_register_or_zero(&mut self, host: u8, guest: u8) -> u8 {
@@ -6476,34 +8482,34 @@ impl A64Emitter {
             return;
         }
         let offset = u16::from(guest) * 8;
-        self.emit(
-            str_u64(host, reg_ptr, offset),
-            format!("str x{host}, [x{reg_ptr}, #{offset}] ; store guest x{guest}"),
-        );
+        self.emit_fmt(str_u64(host, reg_ptr, offset), || {
+            format!("str x{host}, [x{reg_ptr}, #{offset}] ; store guest x{guest}")
+        });
     }
 
     fn emit_host_move(&mut self, rd: u8, rn: u8, suffix: &str) {
         if rd == rn {
             return;
         }
-        let src = if rn == A64_ZERO_REGISTER {
-            "xzr".to_string()
-        } else {
-            format!("x{rn}")
-        };
-        self.emit(mov_reg(rd, rn), format!("mov x{rd}, {src}{suffix}"));
+        self.emit_fmt(mov_reg(rd, rn), || {
+            let src = if rn == A64_ZERO_REGISTER {
+                "xzr".to_string()
+            } else {
+                format!("x{rn}")
+            };
+            format!("mov x{rd}, {src}{suffix}")
+        });
     }
 
     fn mov_imm64(&mut self, rd: u8, value: u64) {
         if value == 0 {
-            self.emit(mov_reg(rd, A64_ZERO_REGISTER), format!("mov x{rd}, xzr"));
+            self.emit_fmt(mov_reg(rd, A64_ZERO_REGISTER), || format!("mov x{rd}, xzr"));
             return;
         }
         if value == u64::MAX {
-            self.emit(
-                orn_reg(rd, A64_ZERO_REGISTER, A64_ZERO_REGISTER),
-                format!("mvn x{rd}, xzr"),
-            );
+            self.emit_fmt(orn_reg(rd, A64_ZERO_REGISTER, A64_ZERO_REGISTER), || {
+                format!("mvn x{rd}, xzr")
+            });
             return;
         }
 
@@ -6511,27 +8517,25 @@ impl A64Emitter {
         for halfword in 0..4 {
             let imm = ((value >> (halfword * 16)) & 0xffff) as u16;
             if !emitted {
-                self.emit(
-                    movz(rd, imm, halfword),
-                    format!("movz x{rd}, #0x{imm:04x}, lsl #{}", halfword * 16),
-                );
+                self.emit_fmt(movz(rd, imm, halfword), || {
+                    format!("movz x{rd}, #0x{imm:04x}, lsl #{}", halfword * 16)
+                });
                 emitted = true;
             } else if imm != 0 {
-                self.emit(
-                    movk(rd, imm, halfword),
-                    format!("movk x{rd}, #0x{imm:04x}, lsl #{}", halfword * 16),
-                );
+                self.emit_fmt(movk(rd, imm, halfword), || {
+                    format!("movk x{rd}, #0x{imm:04x}, lsl #{}", halfword * 16)
+                });
             }
         }
     }
 
     fn ret(&mut self) {
-        self.emit(0xd65f_03c0, "ret".to_string());
+        self.emit_static(0xd65f_03c0, "ret");
     }
 
     fn emit_call(&mut self, target: u64, name: &str) {
         self.mov_imm64(CALL_TARGET, target);
-        self.emit(blr(CALL_TARGET), format!("blr x{CALL_TARGET} ; {name}"));
+        self.emit_fmt(blr(CALL_TARGET), || format!("blr x{CALL_TARGET} ; {name}"));
     }
 
     fn emit_patchable_branch(&mut self, text: String) -> usize {
@@ -6576,6 +8580,30 @@ impl A64Emitter {
         self.code.extend(word.to_le_bytes());
         if self.include_listing {
             self.listing.push(NativeEmission { offset, word, text });
+        }
+    }
+
+    fn emit_static(&mut self, word: u32, text: &'static str) {
+        let offset = self.code.len();
+        self.code.extend(word.to_le_bytes());
+        if self.include_listing {
+            self.listing.push(NativeEmission {
+                offset,
+                word,
+                text: text.to_string(),
+            });
+        }
+    }
+
+    fn emit_fmt(&mut self, word: u32, make_text: impl FnOnce() -> String) {
+        let offset = self.code.len();
+        self.code.extend(word.to_le_bytes());
+        if self.include_listing {
+            self.listing.push(NativeEmission {
+                offset,
+                word,
+                text: make_text(),
+            });
         }
     }
 }
@@ -7148,6 +9176,7 @@ fn is_pure_integer_gap_instruction(instruction: NativeInstruction) -> bool {
         | NativeInstruction::Ori { .. }
         | NativeInstruction::Sll { .. }
         | NativeInstruction::Slli { .. }
+        | NativeInstruction::ShiftedWordOr { .. }
         | NativeInstruction::Slliw { .. }
         | NativeInstruction::Sllw { .. }
         | NativeInstruction::Slt { .. }
@@ -7254,6 +9283,7 @@ fn instruction_reads_guest_register(instruction: NativeInstruction, guest: u8) -
             rs1_or_uimm: rs1, ..
         }
         | NativeInstruction::Slli { rs1, .. }
+        | NativeInstruction::ShiftedWordOr { rs1, .. }
         | NativeInstruction::Slliw { rs1, .. }
         | NativeInstruction::Slti { rs1, .. }
         | NativeInstruction::Sltiu { rs1, .. }
@@ -7262,6 +9292,11 @@ fn instruction_reads_guest_register(instruction: NativeInstruction, guest: u8) -
         | NativeInstruction::Srli { rs1, .. }
         | NativeInstruction::Srliw { rs1, .. }
         | NativeInstruction::Xori { rs1, .. } => rs1 == guest,
+        NativeInstruction::ByteCopy8 {
+            load_base,
+            store_base,
+            ..
+        } => load_base == guest || store_base == guest,
         NativeInstruction::Move { rs, .. } => rs == guest,
         NativeInstruction::RuntimeFloat { rs1, rs2, rs3, .. } => {
             rs1 == guest || rs2 == guest || rs3 == guest
@@ -7335,6 +9370,19 @@ fn a64_register_name(register: u8) -> String {
     }
 }
 
+fn jit_fast_cache_field_offset(entry: usize, field_offset: usize) -> u16 {
+    debug_assert!(entry < JIT_FAST_CACHE_ENTRIES);
+    let offset = RV64GC_RAM_OFFSET
+        + RAM_JIT_FAST_CACHES_OFFSET
+        + entry * std::mem::size_of::<crate::ram::JitFastMemoryCache>()
+        + field_offset;
+    debug_assert!(
+        offset <= u16::MAX as usize,
+        "JIT fast memory cache offset {offset} is too large for unsigned AArch64 loads"
+    );
+    offset as u16
+}
+
 fn invert_condition(condition: A64Cond) -> A64Cond {
     match condition {
         A64Cond::Eq => A64Cond::Ne,
@@ -7365,9 +9413,69 @@ fn ldr_u64(rt: u8, rn: u8, offset: u16) -> u32 {
     0xf940_0000 | (u32::from(offset / 8) << 10) | (u32::from(rn) << 5) | u32::from(rt)
 }
 
+fn ldr_q(vt: u8, rn: u8, offset: u16) -> u32 {
+    debug_assert!(vt < 32);
+    debug_assert_eq!(offset % 16, 0);
+    0x3dc0_0000 | (u32::from(offset / 16) << 10) | (u32::from(rn) << 5) | u32::from(vt)
+}
+
+fn cmeq_zero_16b(vd: u8, vn: u8) -> u32 {
+    debug_assert!(vd < 32);
+    debug_assert!(vn < 32);
+    0x4e20_9800 | (u32::from(vn) << 5) | u32::from(vd)
+}
+
+fn umaxv_b(vd: u8, vn: u8) -> u32 {
+    debug_assert!(vd < 32);
+    debug_assert!(vn < 32);
+    0x6e30_a800 | (u32::from(vn) << 5) | u32::from(vd)
+}
+
+fn umov_w_from_b_lane0(rt: u8, vn: u8) -> u32 {
+    debug_assert!(rt < 32);
+    debug_assert!(vn < 32);
+    0x0e01_3c00 | (u32::from(vn) << 5) | u32::from(rt)
+}
+
+fn ldr_u8_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0x3860_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn ldr_u16_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0x7860_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn ldr_u32_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0xb860_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn ldr_u64_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0xf860_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
 fn str_u64(rt: u8, rn: u8, offset: u16) -> u32 {
     debug_assert_eq!(offset % 8, 0);
     0xf900_0000 | (u32::from(offset / 8) << 10) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn str_u8(rt: u8, rn: u8, offset: u16) -> u32 {
+    0x3900_0000 | (u32::from(offset) << 10) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn str_u8_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0x3820_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn str_u16_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0x7820_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn str_u32_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0xb820_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+fn str_u64_reg(rt: u8, rn: u8, rm: u8) -> u32 {
+    0xf820_6800 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
 }
 
 fn add_reg(rd: u8, rn: u8, rm: u8) -> u32 {
@@ -7396,6 +9504,11 @@ fn ands_reg(rd: u8, rn: u8, rm: u8) -> u32 {
 
 fn orr_reg(rd: u8, rn: u8, rm: u8) -> u32 {
     0xaa00_0000 | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd)
+}
+
+fn orr_lsl_imm(rd: u8, rn: u8, rm: u8, shamt: u32) -> u32 {
+    debug_assert!(shamt < 64);
+    0xaa00_0000 | (u32::from(rm) << 16) | (shamt << 10) | (u32::from(rn) << 5) | u32::from(rd)
 }
 
 fn orn_reg(rd: u8, rn: u8, rm: u8) -> u32 {
@@ -7592,6 +9705,14 @@ fn b_cond(branch_offset: usize, target_offset: usize, cond: A64Cond) -> u32 {
     0x5400_0000 | (((instruction_delta as u32) & 0x7ffff) << 5) | u32::from(cond.code())
 }
 
+fn b_uncond(branch_offset: usize, target_offset: usize) -> u32 {
+    let byte_delta = target_offset as isize - branch_offset as isize;
+    debug_assert_eq!(byte_delta % 4, 0);
+    let instruction_delta = (byte_delta / 4) as i32;
+    debug_assert!((-0x200_0000..0x200_0000).contains(&instruction_delta));
+    0x1400_0000 | ((instruction_delta as u32) & 0x03ff_ffff)
+}
+
 fn cbz(branch_offset: usize, target_offset: usize, rt: u8) -> u32 {
     let byte_delta = target_offset as isize - branch_offset as isize;
     debug_assert_eq!(byte_delta % 4, 0);
@@ -7664,7 +9785,9 @@ fn ldp_post(rt: u8, rt2: u8, rn: u8, offset: i16) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BlockOperation, BlockStop, MemoryWidth};
     use super::*;
+    use crate::ram::MemoryRegion;
 
     #[test]
     fn logical_immediate_encoder_round_trips_common_masks() {
@@ -7701,6 +9824,16 @@ mod tests {
         assert_eq!(ldr_u16(7, 26, 6), 0x7940_0f47);
         assert_eq!(ldr_u32(7, 26, 12), 0xb940_0f47);
         assert_eq!(ldr_u64(7, 26, 24), 0xf940_0f47);
+        assert_eq!(str_u8(2, 10, 0), 0x3900_0142);
+        assert_eq!(str_u8(7, 26, 3), 0x3900_0f47);
+        assert_eq!(ldr_q(0, 26, 0), 0x3dc0_0340);
+        assert_eq!(ldr_q(3, 26, 16), 0x3dc0_0743);
+        assert_eq!(cmeq_zero_16b(0, 0), 0x4e20_9800);
+        assert_eq!(cmeq_zero_16b(5, 4), 0x4e20_9885);
+        assert_eq!(umaxv_b(0, 0), 0x6e30_a800);
+        assert_eq!(umaxv_b(7, 5), 0x6e30_a8a7);
+        assert_eq!(umov_w_from_b_lane0(10, 0), 0x0e01_3c0a);
+        assert_eq!(umov_w_from_b_lane0(9, 7), 0x0e01_3ce9);
         assert_eq!(sdiv_reg(7, 8, 9), 0x9ac9_0d07);
         assert_eq!(udiv_reg(7, 8, 9), 0x9ac9_0907);
         assert_eq!(sdiv_reg32(7, 8, 9), 0x1ac9_0d07);
@@ -7711,6 +9844,411 @@ mod tests {
         assert_eq!(msub_reg32(7, 8, 9, 10), 0x1b09_a907);
         assert_eq!(cmp_reg32(8, 9), 0x6b09_011f);
         assert_eq!(csinv(11, 11, A64_ZERO_REGISTER, A64Cond::Ne), 0xda9f_116b);
+    }
+
+    #[test]
+    fn register_allocated_load_blocks_save_link_register_for_slow_path_calls() {
+        let plan = BlockPlan {
+            start_pc: 0x1000,
+            end_pc: 0x1010,
+            operations: vec![
+                BlockOperation {
+                    pc: 0x1000,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Load {
+                        rd: 5,
+                        rs1: 10,
+                        imm: 0,
+                        width: MemoryWidth::Double,
+                        signed: false,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1004,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Add {
+                        rd: 6,
+                        rs1: 5,
+                        rs2: 11,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1008,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Bne {
+                        rs1: 6,
+                        rs2: 0,
+                        target: 0x2000,
+                        fallthrough: 0x100c,
+                    }),
+                },
+            ],
+            fingerprint: Vec::new(),
+            code_version: 0,
+            stop: BlockStop::ControlFlow { pc: 0x1008 },
+            guest_instruction_count: 3,
+            profile_instructions: Vec::new(),
+        };
+
+        let mut backend = AArch64Backend::new();
+        let block = backend
+            .compile(&plan, JitTier::Optimized, true)
+            .expect("register allocated load block should compile");
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(listing.contains("stp x29, x30, [sp, #-16]!"));
+        assert!(listing.contains("blr x16 ; jit_runtime_load_u64"));
+        assert!(listing.contains("ldp x29, x30, [sp], #16"));
+        assert!(listing.contains("regalloc load result"));
+        assert!(listing.contains("memory load slow path preserve"));
+        assert!(!listing.contains("fast load cache 1"));
+    }
+
+    #[test]
+    fn straight_line_store_bursts_use_one_fast_cache_check() {
+        let plan = BlockPlan {
+            start_pc: 0x1000,
+            end_pc: 0x1010,
+            operations: vec![
+                BlockOperation {
+                    pc: 0x1000,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Addi {
+                        rd: 2,
+                        rs1: 2,
+                        imm: -96,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1004,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Store {
+                        rs1: 2,
+                        rs2: 8,
+                        imm: 88,
+                        width: MemoryWidth::Double,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1008,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Store {
+                        rs1: 2,
+                        rs2: 9,
+                        imm: 80,
+                        width: MemoryWidth::Double,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x100c,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Store {
+                        rs1: 2,
+                        rs2: 10,
+                        imm: 72,
+                        width: MemoryWidth::Double,
+                    }),
+                },
+            ],
+            fingerprint: Vec::new(),
+            code_version: 0,
+            stop: BlockStop::MaxInstructions,
+            guest_instruction_count: 4,
+            profile_instructions: Vec::new(),
+        };
+
+        let mut backend = AArch64Backend::new();
+        let block = backend
+            .compile(&plan, JitTier::Baseline, true)
+            .expect("store burst block should compile");
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(listing.contains("fast store burst cache 0 lower bound"));
+        assert!(listing.contains("fast store burst cache 0 upper bound"));
+        assert!(listing.contains("fast store burst x8"));
+        assert!(listing.contains("fast store burst x9"));
+        assert!(listing.contains("fast store burst x10"));
+
+        let mut cpu = RV64GC::new();
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, 0x100, vec![0; 0x100]))
+            .unwrap();
+        cpu.ram.direct_write_ptr_range(0x1048, 24).unwrap();
+        cpu.registers[2usize] = 0x1060;
+        cpu.registers[8usize] = 0x1111_2222_3333_4444;
+        cpu.registers[9usize] = 0x5555_6666_7777_8888;
+        cpu.registers[10usize] = 0x9999_aaaa_bbbb_cccc;
+
+        let executed = block.execute(&mut cpu);
+
+        assert_eq!(executed, 4);
+        assert_eq!(cpu.registers[2usize], 0x1000);
+        assert_eq!(cpu.registers[32usize], 0x1010);
+        assert_eq!(
+            cpu.ram.read_u64_cached(0x1058).unwrap(),
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(
+            cpu.ram.read_u64_cached(0x1050).unwrap(),
+            0x5555_6666_7777_8888
+        );
+        assert_eq!(
+            cpu.ram.read_u64_cached(0x1048).unwrap(),
+            0x9999_aaaa_bbbb_cccc
+        );
+    }
+
+    #[test]
+    fn byte_xor_trace_loop_uses_direct_host_pointers() {
+        let plan = byte_xor_trace_plan();
+        let mut backend = AArch64Backend::new();
+        let block = backend
+            .compile(&plan, JitTier::Trace, true)
+            .expect("byte-xor trace loop should compile");
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(listing.matches("byte-xor trace iterations").count() >= 4);
+        assert!(listing.contains("blr x16 ; jit_runtime_try_direct_read_ptr"));
+        assert!(listing.contains("blr x16 ; jit_runtime_try_direct_write_ptr"));
+        assert!(listing.contains("b.ne .byte_xor_trace_loop"));
+
+        let mut cpu = RV64GC::new();
+        cpu.ram
+            .add_region(MemoryRegion::new(
+                0x1000,
+                16,
+                (0u8..16).map(|value| value.wrapping_mul(3)).collect(),
+            ))
+            .unwrap();
+        cpu.ram
+            .add_region(MemoryRegion::new(0x2000, 4, vec![0xa5, 0x5a, 0, 0]))
+            .unwrap();
+        cpu.ram
+            .add_region(MemoryRegion::new(0x3000, 4, vec![0; 4]))
+            .unwrap();
+        cpu.registers[9usize] = 0x3000;
+        cpu.registers[19usize] = 3;
+        cpu.registers[20usize] = 14;
+        cpu.registers[21usize] = 0x1000;
+        cpu.registers[23usize] = 0x2000;
+
+        let executed = block.execute(&mut cpu);
+
+        assert_eq!(executed, 24);
+        assert_eq!(cpu.registers[9usize], 0x3002);
+        assert_eq!(cpu.registers[19usize], 1);
+        assert_eq!(cpu.registers[20usize], 0);
+        assert_eq!(cpu.registers[23usize], 0x2002);
+        assert_eq!(cpu.registers[32usize], 0x3000);
+        assert_eq!(cpu.ram.read_byte(0x3000).unwrap(), 0xa5 ^ (14 * 3));
+        assert_eq!(cpu.ram.read_byte(0x3001).unwrap(), 0x5a ^ (15 * 3));
+    }
+
+    #[test]
+    fn byte_xor_trace_loop_uses_eight_byte_chunk() {
+        let plan = byte_xor_trace_plan();
+        let mut backend = AArch64Backend::new();
+        let block = backend
+            .compile(&plan, JitTier::Trace, true)
+            .expect("byte-xor trace loop should compile");
+        let listing = block
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(listing.contains("byte-xor chunk store"));
+        assert!(listing.contains("byte-xor chunk last value"));
+
+        let key: Vec<u8> = (0x10..0x20).collect();
+        let source: Vec<u8> = (0x20..0x30).collect();
+        let mut cpu = RV64GC::new();
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, key.len() as u64, key.clone()))
+            .unwrap();
+        cpu.ram
+            .add_region(MemoryRegion::new(
+                0x2000,
+                source.len() as u64,
+                source.clone(),
+            ))
+            .unwrap();
+        cpu.ram
+            .add_region(MemoryRegion::new(0x3000, 16, vec![0; 16]))
+            .unwrap();
+        cpu.registers[9usize] = 0x3000;
+        cpu.registers[19usize] = 8;
+        cpu.registers[20usize] = 0;
+        cpu.registers[21usize] = 0x1000;
+        cpu.registers[23usize] = 0x2000;
+
+        let executed = block.execute(&mut cpu);
+
+        assert_eq!(executed, 95);
+        assert_eq!(cpu.registers[9usize], 0x3008);
+        assert_eq!(cpu.registers[19usize], 0);
+        assert_eq!(cpu.registers[20usize], 8);
+        assert_eq!(cpu.registers[23usize], 0x2008);
+        assert_eq!(cpu.registers[10usize], u64::from(key[7] ^ source[7]));
+        assert_eq!(cpu.registers[11usize], u64::from(source[7]));
+        assert_eq!(cpu.registers[32usize], 0x2000);
+        for index in 0..8 {
+            assert_eq!(
+                cpu.ram.read_byte(0x3000 + index as u64).unwrap(),
+                key[index] ^ source[index]
+            );
+        }
+    }
+
+    fn byte_xor_trace_plan() -> BlockPlan {
+        BlockPlan {
+            start_pc: 0x1000,
+            end_pc: 0x1000,
+            operations: vec![
+                BlockOperation {
+                    pc: 0x1000,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Add {
+                        rd: 10,
+                        rs1: 21,
+                        rs2: 20,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1004,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Load {
+                        rd: 11,
+                        rs1: 23,
+                        imm: 0,
+                        width: MemoryWidth::Byte,
+                        signed: true,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1008,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Load {
+                        rd: 10,
+                        rs1: 10,
+                        imm: 0,
+                        width: MemoryWidth::Byte,
+                        signed: true,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x100c,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Xor {
+                        rd: 10,
+                        rs1: 10,
+                        rs2: 11,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1010,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Addiw {
+                        rd: 20,
+                        rs1: 20,
+                        imm: 1,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1014,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Store {
+                        rs1: 9,
+                        rs2: 10,
+                        imm: 0,
+                        width: MemoryWidth::Byte,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1018,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Andi {
+                        rd: 20,
+                        rs1: 20,
+                        imm: 15,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x101c,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Addi {
+                        rd: 19,
+                        rs1: 19,
+                        imm: -1,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1020,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Addi {
+                        rd: 9,
+                        rs1: 9,
+                        imm: 1,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1024,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::Addi {
+                        rd: 23,
+                        rs1: 23,
+                        imm: 1,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x1028,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::TraceGuard {
+                        rs1: 19,
+                        rs2: 0,
+                        condition: IntegerBranchCondition::Eq,
+                        continue_on_taken: false,
+                        continue_pc: 0x102c,
+                        side_exit_pc: 0x2000,
+                        executed_instructions: 11,
+                    }),
+                },
+                BlockOperation {
+                    pc: 0x102c,
+                    opcode: 0,
+                    kind: BlockOperationKind::Native(NativeInstruction::TraceLoopGuard {
+                        rs1: 20,
+                        rs2: 0,
+                        condition: IntegerBranchCondition::Ne,
+                        continue_on_taken: true,
+                        loop_pc: 0x1000,
+                        side_exit_pc: 0x3000,
+                        guest_instruction_count: 12,
+                    }),
+                },
+            ],
+            fingerprint: Vec::new(),
+            code_version: 0,
+            stop: BlockStop::ControlFlow { pc: 0x102c },
+            guest_instruction_count: 12,
+            profile_instructions: Vec::new(),
+        }
     }
 
     fn decode_logical_immediate_for_test(imm: LogicalImmediate, width: u32) -> u64 {

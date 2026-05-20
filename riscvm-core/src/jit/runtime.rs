@@ -2,6 +2,7 @@ use crate::cpu::RV64GCRegAbiName::Pc;
 use crate::cpu::RV64GC;
 use crate::fcsr::{classify_f32, classify_f64, round_f32, round_f64, RoundingMode, FCSR};
 use crate::sign_extend;
+use std::ptr;
 
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +148,14 @@ pub(crate) enum RuntimeFloatOp {
     CvtDS,
     CvtWD,
     CvtWuD,
+    CvtLD,
+    CvtLuD,
     CvtDW,
     CvtDWu,
+    CvtDL,
+    CvtDLu,
     MvXD,
+    MvDX,
 }
 
 impl RuntimeFloatOp {
@@ -185,6 +191,10 @@ impl RuntimeFloatOp {
                 | Self::CvtSD
                 | Self::CvtWD
                 | Self::CvtWuD
+                | Self::CvtLD
+                | Self::CvtLuD
+                | Self::CvtDL
+                | Self::CvtDLu
         )
     }
 }
@@ -220,7 +230,9 @@ pub(crate) unsafe extern "C" fn jit_runtime_load_u8(cpu: *mut RV64GC, addr: u64)
     let Some(cpu) = runtime_cpu(cpu, "load") else {
         return 0;
     };
-    read_runtime_memory(cpu, addr, 1, "load").unwrap_or(0)
+    read_runtime_u8(cpu, addr, "load")
+        .map(u64::from)
+        .unwrap_or(0)
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_load_i8(cpu: *mut RV64GC, addr: u64) -> u64 {
@@ -231,7 +243,9 @@ pub(crate) unsafe extern "C" fn jit_runtime_load_u16(cpu: *mut RV64GC, addr: u64
     let Some(cpu) = runtime_cpu(cpu, "load") else {
         return 0;
     };
-    read_runtime_memory(cpu, addr, 2, "load").unwrap_or(0)
+    read_runtime_u16(cpu, addr, "load")
+        .map(u64::from)
+        .unwrap_or(0)
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_load_i16(cpu: *mut RV64GC, addr: u64) -> u64 {
@@ -242,7 +256,9 @@ pub(crate) unsafe extern "C" fn jit_runtime_load_u32(cpu: *mut RV64GC, addr: u64
     let Some(cpu) = runtime_cpu(cpu, "load") else {
         return 0;
     };
-    read_runtime_memory(cpu, addr, 4, "load").unwrap_or(0)
+    read_runtime_u32(cpu, addr, "load")
+        .map(u64::from)
+        .unwrap_or(0)
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_load_i32(cpu: *mut RV64GC, addr: u64) -> u64 {
@@ -253,7 +269,7 @@ pub(crate) unsafe extern "C" fn jit_runtime_load_u64(cpu: *mut RV64GC, addr: u64
     let Some(cpu) = runtime_cpu(cpu, "load") else {
         return 0;
     };
-    read_runtime_memory(cpu, addr, 8, "load").unwrap_or(0)
+    read_runtime_u64(cpu, addr, "load").unwrap_or(0)
 }
 
 #[allow(dead_code)]
@@ -273,28 +289,28 @@ pub(crate) unsafe extern "C" fn jit_runtime_store_u8(cpu: *mut RV64GC, addr: u64
     let Some(cpu) = runtime_cpu(cpu, "store") else {
         return;
     };
-    write_runtime_memory(cpu, addr, value, 1, "store");
+    write_runtime_u8(cpu, addr, value as u8, "store");
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_store_u16(cpu: *mut RV64GC, addr: u64, value: u64) {
     let Some(cpu) = runtime_cpu(cpu, "store") else {
         return;
     };
-    write_runtime_memory(cpu, addr, value, 2, "store");
+    write_runtime_u16(cpu, addr, value as u16, "store");
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_store_u32(cpu: *mut RV64GC, addr: u64, value: u64) {
     let Some(cpu) = runtime_cpu(cpu, "store") else {
         return;
     };
-    write_runtime_memory(cpu, addr, value, 4, "store");
+    write_runtime_u32(cpu, addr, value as u32, "store");
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_store_u64(cpu: *mut RV64GC, addr: u64, value: u64) {
     let Some(cpu) = runtime_cpu(cpu, "store") else {
         return;
     };
-    write_runtime_memory(cpu, addr, value, 8, "store");
+    write_runtime_u64(cpu, addr, value, "store");
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_direct_write_ptr(
@@ -318,6 +334,21 @@ pub(crate) unsafe extern "C" fn jit_runtime_direct_write_ptr(
     }
 }
 
+pub(crate) unsafe extern "C" fn jit_runtime_try_direct_write_ptr(
+    cpu: *mut RV64GC,
+    addr: u64,
+    len: u64,
+) -> u64 {
+    let Some(cpu) = runtime_cpu(cpu, "try_direct_write_ptr") else {
+        return 0;
+    };
+
+    cpu.ram
+        .direct_write_ptr_range(addr, len)
+        .map(|ptr| ptr as usize as u64)
+        .unwrap_or(0)
+}
+
 pub(crate) unsafe extern "C" fn jit_runtime_try_direct_read_ptr(
     cpu: *mut RV64GC,
     addr: u64,
@@ -331,6 +362,38 @@ pub(crate) unsafe extern "C" fn jit_runtime_try_direct_read_ptr(
         .direct_read_ptr_range(addr, len)
         .map(|ptr| ptr as usize as u64)
         .unwrap_or(0)
+}
+
+pub(crate) unsafe extern "C" fn jit_runtime_try_direct_byte_copy(
+    cpu: *mut RV64GC,
+    dest: u64,
+    src: u64,
+    len: u64,
+) -> u64 {
+    const FAILURE: u64 = u64::MAX;
+
+    let Some(cpu) = runtime_cpu(cpu, "try_direct_byte_copy") else {
+        return FAILURE;
+    };
+    let Ok(len) = usize::try_from(len) else {
+        return FAILURE;
+    };
+    if len == 0 || guest_byte_ranges_overlap(dest, src, len) {
+        return FAILURE;
+    }
+
+    let Ok(src_ptr) = cpu.ram.direct_read_ptr_range(src, len as u64) else {
+        return FAILURE;
+    };
+    let Ok(dest_ptr) = cpu.ram.direct_write_ptr_range(dest, len as u64) else {
+        return FAILURE;
+    };
+
+    let last_byte = unsafe { *src_ptr.add(len - 1) };
+    unsafe {
+        ptr::copy_nonoverlapping(src_ptr, dest_ptr, len);
+    }
+    u64::from(last_byte)
 }
 
 pub(crate) unsafe extern "C" fn jit_runtime_float_load(
@@ -639,6 +702,20 @@ pub(crate) unsafe extern "C" fn jit_runtime_float_op(
                 sign_extend(u64::from(round_f64(value, rounding_mode) as u32), 32) as u64,
             );
         }
+        RuntimeFloatOp::CvtLD => {
+            let Some(rounding_mode) = rounding_mode else {
+                return;
+            };
+            let value = f64::from_bits(cpu.float_registers[rs1 as usize]);
+            write_runtime_integer(cpu, rd, round_f64(value, rounding_mode) as i64 as u64);
+        }
+        RuntimeFloatOp::CvtLuD => {
+            let Some(rounding_mode) = rounding_mode else {
+                return;
+            };
+            let value = f64::from_bits(cpu.float_registers[rs1 as usize]);
+            write_runtime_integer(cpu, rd, round_f64(value, rounding_mode) as u64);
+        }
         RuntimeFloatOp::CvtDW => {
             cpu.float_registers[rd as usize] =
                 (cpu.registers[rs1 as usize] as i32 as f64).to_bits();
@@ -647,8 +724,25 @@ pub(crate) unsafe extern "C" fn jit_runtime_float_op(
             cpu.float_registers[rd as usize] =
                 (cpu.registers[rs1 as usize] as u32 as f64).to_bits();
         }
+        RuntimeFloatOp::CvtDL => {
+            let Some(rounding_mode) = rounding_mode else {
+                return;
+            };
+            let value = cpu.registers[rs1 as usize] as i64 as f64;
+            cpu.float_registers[rd as usize] = round_f64(value, rounding_mode).to_bits();
+        }
+        RuntimeFloatOp::CvtDLu => {
+            let Some(rounding_mode) = rounding_mode else {
+                return;
+            };
+            let value = cpu.registers[rs1 as usize] as f64;
+            cpu.float_registers[rd as usize] = round_f64(value, rounding_mode).to_bits();
+        }
         RuntimeFloatOp::MvXD => {
             write_runtime_integer(cpu, rd, cpu.float_registers[rs1 as usize]);
+        }
+        RuntimeFloatOp::MvDX => {
+            cpu.float_registers[rd as usize] = cpu.registers[rs1 as usize];
         }
     }
 }
@@ -943,6 +1037,17 @@ fn runtime_cpu<'a>(cpu: *mut RV64GC, operation: &str) -> Option<&'a mut RV64GC> 
     cpu
 }
 
+fn guest_byte_ranges_overlap(lhs: u64, rhs: u64, len: usize) -> bool {
+    let len = len as u64;
+    let Some(lhs_end) = lhs.checked_add(len) else {
+        return true;
+    };
+    let Some(rhs_end) = rhs.checked_add(len) else {
+        return true;
+    };
+    lhs < rhs_end && rhs < lhs_end
+}
+
 fn read_runtime_memory(cpu: &mut RV64GC, addr: u64, width: u64, operation: &str) -> Option<u64> {
     if !matches!(width, 1 | 2 | 4 | 8) {
         record_runtime_fault(cpu, format!("{operation} invalid width {width}"));
@@ -955,6 +1060,58 @@ fn read_runtime_memory(cpu: &mut RV64GC, addr: u64, width: u64, operation: &str)
             record_runtime_fault(
                 cpu,
                 format!("{operation} failed at 0x{addr:016x} width={width}: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn read_runtime_u8(cpu: &mut RV64GC, addr: u64, operation: &str) -> Option<u8> {
+    match cpu.ram.read_u8_cached(addr) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=1: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn read_runtime_u16(cpu: &mut RV64GC, addr: u64, operation: &str) -> Option<u16> {
+    match cpu.ram.read_u16_cached(addr) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=2: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn read_runtime_u32(cpu: &mut RV64GC, addr: u64, operation: &str) -> Option<u32> {
+    match cpu.ram.read_u32_cached(addr) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=4: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn read_runtime_u64(cpu: &mut RV64GC, addr: u64, operation: &str) -> Option<u64> {
+    match cpu.ram.read_u64_cached(addr) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=8: {error}"),
             );
             None
         }
@@ -979,6 +1136,58 @@ fn write_runtime_memory(
             record_runtime_fault(
                 cpu,
                 format!("{operation} failed at 0x{addr:016x} width={width}: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_runtime_u8(cpu: &mut RV64GC, addr: u64, value: u8, operation: &str) -> Option<()> {
+    match cpu.ram.write_u8_cached(addr, value) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=1: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_runtime_u16(cpu: &mut RV64GC, addr: u64, value: u16, operation: &str) -> Option<()> {
+    match cpu.ram.write_u16_cached(addr, value) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=2: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_runtime_u32(cpu: &mut RV64GC, addr: u64, value: u32, operation: &str) -> Option<()> {
+    match cpu.ram.write_u32_cached(addr, value) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=4: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_runtime_u64(cpu: &mut RV64GC, addr: u64, value: u64, operation: &str) -> Option<()> {
+    match cpu.ram.write_u64_cached(addr, value) {
+        Ok(()) => Some(()),
+        Err(error) => {
+            record_runtime_fault(
+                cpu,
+                format!("{operation} failed at 0x{addr:016x} width=8: {error}"),
             );
             None
         }
@@ -1092,9 +1301,14 @@ fn runtime_float_op(raw: u64) -> Option<RuntimeFloatOp> {
         x if x == RuntimeFloatOp::CvtDS as u64 => Some(RuntimeFloatOp::CvtDS),
         x if x == RuntimeFloatOp::CvtWD as u64 => Some(RuntimeFloatOp::CvtWD),
         x if x == RuntimeFloatOp::CvtWuD as u64 => Some(RuntimeFloatOp::CvtWuD),
+        x if x == RuntimeFloatOp::CvtLD as u64 => Some(RuntimeFloatOp::CvtLD),
+        x if x == RuntimeFloatOp::CvtLuD as u64 => Some(RuntimeFloatOp::CvtLuD),
         x if x == RuntimeFloatOp::CvtDW as u64 => Some(RuntimeFloatOp::CvtDW),
         x if x == RuntimeFloatOp::CvtDWu as u64 => Some(RuntimeFloatOp::CvtDWu),
+        x if x == RuntimeFloatOp::CvtDL as u64 => Some(RuntimeFloatOp::CvtDL),
+        x if x == RuntimeFloatOp::CvtDLu as u64 => Some(RuntimeFloatOp::CvtDLu),
         x if x == RuntimeFloatOp::MvXD as u64 => Some(RuntimeFloatOp::MvXD),
+        x if x == RuntimeFloatOp::MvDX as u64 => Some(RuntimeFloatOp::MvDX),
         _ => None,
     }
 }

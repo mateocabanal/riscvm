@@ -290,6 +290,7 @@ fn zicsr_decoder_recognizes_fence_i_and_csr_forms() {
     let cpu = cpu();
 
     assert!(matches!(cpu.find_instruction(0x0000_100f), FenceI));
+    assert!(matches!(cpu.find_instruction(0x8330_000f), Fence(3, 3)));
     assert!(matches!(
         cpu.find_instruction(0x0012_9073),
         Csrrw(0, 5, 0x001)

@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::raw::{c_char, c_int, c_void};
 #[cfg(unix)]
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::cpu::RV64GCRegAbiName::*;
 use crate::cpu::{RV64GCInstruction, RV64GC};
+use crate::debug;
 use crate::tracer::{ExecutionEngine, InstructionTrace};
 use crate::{sign_extend, sign_extend12};
 
@@ -17,6 +21,7 @@ mod aarch64;
 #[cfg_attr(not(all(target_arch = "aarch64", unix)), allow(dead_code))]
 mod background;
 mod optimizer;
+mod profile;
 #[cfg_attr(not(all(target_arch = "aarch64", unix)), allow(dead_code))]
 mod runtime;
 mod tier;
@@ -24,6 +29,10 @@ mod trace;
 
 use background::{BackgroundCompileResult, BackgroundCompiler, BackgroundEnqueueError};
 use optimizer::{optimize_plan, OptimizationReport};
+pub use profile::{
+    format_startup_profile, normalize_startup_profile, parse_startup_profile,
+    JitStartupProfileEntry, JitStartupProfileParseError,
+};
 use tier::{JitTier, DEFAULT_HOT_THRESHOLD};
 
 #[cfg(all(target_arch = "aarch64", unix))]
@@ -33,13 +42,19 @@ pub(crate) use runtime::{
     jit_runtime_load_i16, jit_runtime_load_i32, jit_runtime_load_i8, jit_runtime_load_u16,
     jit_runtime_load_u32, jit_runtime_load_u64, jit_runtime_load_u8, jit_runtime_store_u16,
     jit_runtime_store_u32, jit_runtime_store_u64, jit_runtime_store_u8, jit_runtime_trap,
-    jit_runtime_try_direct_read_ptr,
+    jit_runtime_try_direct_byte_copy, jit_runtime_try_direct_read_ptr,
+    jit_runtime_try_direct_write_ptr,
 };
 pub(crate) use runtime::{
     MemoryWidth, RuntimeAtomicOp, RuntimeBinaryOp, RuntimeCsrOp, RuntimeFloatOp, RuntimeTrapOp,
 };
 
 const MAX_BLOCK_INSTRUCTIONS: usize = 64;
+const MAX_CACHED_BLOCK_CHAIN: usize = 1024;
+const DISPATCH_CACHE_ENTRIES: usize = 4096;
+const CANDIDATE_BYTE_SCAN_CACHE_ENTRIES: usize = 1024;
+const BASELINE_OPTIMIZER_MIN_INSTRUCTIONS: usize = MAX_BLOCK_INSTRUCTIONS + 1;
+const MAX_REGALLOC_GUEST_REGISTERS: usize = 16;
 const MAX_HOST_LIBC_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HOST_LIBC_C_STRING: usize = 1024 * 1024;
 const HOST_LIBC_EXIT_TRAMPOLINE: u64 = 0xffff_ffff_ff00_0000;
@@ -47,6 +62,77 @@ const HOST_LIBC_EXIT_TRAMPOLINE: u64 = 0xffff_ffff_ff00_0000;
 type FastU64Hasher = BuildHasherDefault<U64IdentityHasher>;
 type FastU64Map<V> = HashMap<u64, V, FastU64Hasher>;
 type FastU64Set = HashSet<u64, FastU64Hasher>;
+
+#[derive(Clone, Copy)]
+struct DispatchCacheEntry {
+    pc: u64,
+    block: *mut CompiledBlock,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateByteScanCacheEntry {
+    pc: u64,
+    code_version: u64,
+    result: CandidateByteScanCacheResult,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateByteScanCacheResult {
+    Empty,
+    NotCandidate,
+    Candidate(CandidateByteScanLoop),
+}
+
+#[derive(Clone, Copy)]
+struct CandidateByteScanLoop {
+    index_register: u8,
+    shadow_register: u8,
+    compare_offset_register: u8,
+    limit_register: u8,
+    exhausted_pc: u64,
+    table_base_register: u8,
+    entry_address_register: u8,
+    candidate_offset_register: u8,
+    candidate_base_register: u8,
+    candidate_pointer_register: u8,
+    lhs_address_register: u8,
+    rhs_address_register: u8,
+    rhs_base_register: u8,
+    lhs_value_register: u8,
+    rhs_value_register: u8,
+    match_pc: u64,
+}
+
+impl DispatchCacheEntry {
+    const fn empty() -> Self {
+        Self {
+            pc: 0,
+            block: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl CandidateByteScanCacheEntry {
+    const fn empty() -> Self {
+        Self {
+            pc: 0,
+            code_version: u64::MAX,
+            result: CandidateByteScanCacheResult::Empty,
+        }
+    }
+
+    fn new(pc: u64, code_version: u64, pattern: Option<CandidateByteScanLoop>) -> Self {
+        let result = match pattern {
+            Some(pattern) => CandidateByteScanCacheResult::Candidate(pattern),
+            None => CandidateByteScanCacheResult::NotCandidate,
+        };
+        Self {
+            pc,
+            code_version,
+            result,
+        }
+    }
+}
 
 #[derive(Default)]
 struct U64IdentityHasher {
@@ -220,6 +306,7 @@ impl JitExecutionMode {
 pub struct JitOptions {
     pub execution_mode: JitExecutionMode,
     pub host_libc: bool,
+    pub host_libc_plt_stdio: bool,
     pub libc_start_main_shortcut: bool,
     pub debug_log: bool,
     pub dump_instructions: bool,
@@ -242,6 +329,7 @@ impl Default for JitOptions {
         Self {
             execution_mode: JitExecutionMode::Hybrid,
             host_libc: true,
+            host_libc_plt_stdio: true,
             libc_start_main_shortcut: false,
             debug_log: false,
             dump_instructions: false,
@@ -263,11 +351,15 @@ impl Default for JitOptions {
 
 pub struct JitEngine {
     backend: NativeBackend,
-    cache: FastU64Map<CompiledBlock>,
+    cache: FastU64Map<Box<CompiledBlock>>,
+    dispatch_cache: Vec<DispatchCacheEntry>,
+    candidate_byte_scan_cache: Vec<CandidateByteScanCacheEntry>,
     pending_optimized_compiles: FastU64Set,
     background_compiler: Option<BackgroundCompiler>,
     options: JitOptions,
     precompiled_entry: bool,
+    precompiled_startup_profile: bool,
+    startup_profile: Vec<JitStartupProfileEntry>,
     host_libc_symbols: FastU64Map<HostLibcFunction>,
     host_libc_symbol_range: Option<(u64, u64)>,
     host_libc_initialized: bool,
@@ -280,7 +372,18 @@ impl JitEngine {
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
-    pub fn with_options(mut options: JitOptions) -> Result<Self, JitError> {
+    pub fn with_options(options: JitOptions) -> Result<Self, JitError> {
+        Self::with_startup_profile(options, [])
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    pub fn with_startup_profile<I>(
+        mut options: JitOptions,
+        startup_profile: I,
+    ) -> Result<Self, JitError>
+    where
+        I: IntoIterator<Item = JitStartupProfileEntry>,
+    {
         options.hot_threshold = options.hot_threshold.max(1);
         options.non_loop_hot_threshold_multiplier =
             options.non_loop_hot_threshold_multiplier.max(1);
@@ -303,10 +406,17 @@ impl JitEngine {
         Ok(Self {
             backend: NativeBackend::new(),
             cache: FastU64Map::default(),
+            dispatch_cache: vec![DispatchCacheEntry::empty(); DISPATCH_CACHE_ENTRIES],
+            candidate_byte_scan_cache: vec![
+                CandidateByteScanCacheEntry::empty();
+                CANDIDATE_BYTE_SCAN_CACHE_ENTRIES
+            ],
             pending_optimized_compiles: FastU64Set::default(),
             background_compiler,
             options,
             precompiled_entry: false,
+            precompiled_startup_profile: false,
+            startup_profile: normalize_startup_profile(startup_profile),
             host_libc_symbols: FastU64Map::default(),
             host_libc_symbol_range: None,
             host_libc_initialized: false,
@@ -323,6 +433,17 @@ impl JitEngine {
         Err(JitError::UnsupportedHost)
     }
 
+    #[cfg(not(all(target_arch = "aarch64", unix)))]
+    pub fn with_startup_profile<I>(
+        _options: JitOptions,
+        _startup_profile: I,
+    ) -> Result<Self, JitError>
+    where
+        I: IntoIterator<Item = JitStartupProfileEntry>,
+    {
+        Err(JitError::UnsupportedHost)
+    }
+
     pub fn run(&mut self, cpu: &mut RV64GC) -> Result<(), JitError> {
         cpu.trace_start(self.options.execution_mode.trace_engine());
         self.ensure_precompiled(cpu)?;
@@ -332,7 +453,19 @@ impl JitEngine {
             self.cache.len()
         ));
         while !cpu.should_quit {
+            if debug::termination_requested() {
+                cpu.should_quit = true;
+                break;
+            }
             self.step_precompiled(cpu)?;
+            self.execute_cached_block_chain(cpu)?;
+            crate::syscalls::run_ready_synthetic_threads(cpu);
+            if let Some(reason) = cpu.take_jit_runtime_fault() {
+                return Err(JitError::RuntimeFault {
+                    pc: cpu.registers[Pc],
+                    reason,
+                });
+            }
             assert_eq!(cpu.registers[Zero], 0);
         }
         self.log(format_args!(
@@ -364,6 +497,9 @@ impl JitEngine {
                 pc,
                 instructions: 1,
             });
+        }
+        if let Some(instructions) = self.try_candidate_byte_scan_loop(cpu, pc) {
+            return Ok(JitStep::Native { pc, instructions });
         }
         if self.try_host_libc(cpu, pc)? {
             return Ok(JitStep::Native {
@@ -477,14 +613,101 @@ impl JitEngine {
             }
         }
 
-        let Some(block) = self.cache.get_mut(&pc) else {
+        let options = self.options;
+        let Some(block) = self.dispatch_block_mut(pc) else {
             return Err(JitError::CompiledBlockMissing { pc });
         };
-        execute_compiled_block(self.options, cpu, pc, block)
+        execute_compiled_block(options, cpu, pc, block)
+    }
+
+    fn execute_cached_block_chain(&mut self, cpu: &mut RV64GC) -> Result<(), JitError> {
+        for _ in 0..MAX_CACHED_BLOCK_CHAIN {
+            if cpu.should_quit || debug::termination_requested() {
+                if debug::termination_requested() {
+                    cpu.should_quit = true;
+                }
+                return Ok(());
+            }
+
+            let pc = cpu.registers[Pc];
+            if pc == HOST_LIBC_EXIT_TRAMPOLINE || self.pc_may_be_host_libc(pc) {
+                return Ok(());
+            }
+            if self.try_candidate_byte_scan_loop(cpu, pc).is_some() {
+                continue;
+            }
+
+            let options = self.options;
+            let Some(block) = self.dispatch_block_mut(pc) else {
+                return Ok(());
+            };
+            if block.is_stale(cpu) || block_needs_compile_check(block, options) {
+                return Ok(());
+            }
+
+            if options.debug_log || cpu.tracer_enabled() {
+                execute_compiled_block(options, cpu, pc, block)?;
+            } else {
+                execute_compiled_block_fast(cpu, pc, block)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_block_mut(&mut self, pc: u64) -> Option<&mut CompiledBlock> {
+        let slot = dispatch_cache_slot(pc);
+        let entry = self.dispatch_cache[slot];
+        if entry.pc == pc && !entry.block.is_null() {
+            // Compiled blocks live behind stable Boxes. Entries are cleared whenever a
+            // block is replaced, so a matching pointer is valid for this engine.
+            return Some(unsafe { &mut *entry.block });
+        }
+
+        let block = self.cache.get_mut(&pc)?;
+        let block = block.as_mut();
+        self.dispatch_cache[slot] = DispatchCacheEntry {
+            pc,
+            block: block as *mut CompiledBlock,
+        };
+        Some(block)
+    }
+
+    fn invalidate_dispatch_cache(&mut self) {
+        self.dispatch_cache.fill(DispatchCacheEntry::empty());
+    }
+
+    fn pc_may_be_host_libc(&self, pc: u64) -> bool {
+        if !self.options.host_libc {
+            return false;
+        }
+        self.host_libc_symbol_range
+            .is_some_and(|(min_pc, max_pc)| pc >= min_pc && pc <= max_pc)
+    }
+
+    fn try_candidate_byte_scan_loop(&mut self, cpu: &mut RV64GC, pc: u64) -> Option<u64> {
+        let slot = candidate_byte_scan_cache_slot(pc);
+        let code_version = cpu.ram.code_version();
+        let entry = self.candidate_byte_scan_cache[slot];
+        let pattern = if entry.pc == pc && entry.code_version == code_version {
+            match entry.result {
+                CandidateByteScanCacheResult::Empty
+                | CandidateByteScanCacheResult::NotCandidate => None,
+                CandidateByteScanCacheResult::Candidate(pattern) => Some(pattern),
+            }
+        } else {
+            let pattern = candidate_byte_scan_loop_from_cpu(cpu, pc);
+            self.candidate_byte_scan_cache[slot] =
+                CandidateByteScanCacheEntry::new(pc, code_version, pattern);
+            pattern
+        }?;
+
+        execute_candidate_byte_scan_loop(cpu, pattern)
     }
 
     fn ensure_precompiled(&mut self, cpu: &mut RV64GC) -> Result<(), JitError> {
         self.ensure_host_libc_symbols(cpu);
+        self.ensure_startup_profile_precompiled(cpu)?;
         if self.precompiled_entry || !self.options.execution_mode.precompiles_before_execution() {
             return Ok(());
         }
@@ -494,6 +717,47 @@ impl JitEngine {
         self.precompiled_entry = true;
         self.log(format_args!(
             "aot precompile complete entry=0x{entry_pc:016x} blocks={compiled_blocks} cache_entries={}",
+            self.cache.len()
+        ));
+        Ok(())
+    }
+
+    fn ensure_startup_profile_precompiled(&mut self, cpu: &mut RV64GC) -> Result<(), JitError> {
+        if self.precompiled_startup_profile || self.startup_profile.is_empty() {
+            return Ok(());
+        }
+
+        let entries = self.startup_profile.clone();
+        let mut compiled_blocks = 0usize;
+        for entry in entries {
+            if self.cache.contains_key(&entry.pc) {
+                continue;
+            }
+
+            let (planned, tier) = startup_profile_plan_for_tier(cpu, entry.pc, self.options);
+            let Some(plan) = planned.plan else {
+                self.log(format_args!(
+                    "skip startup-profile pc=0x{:016x} count={} cause={}",
+                    entry.pc, entry.count, planned.stop
+                ));
+                continue;
+            };
+
+            if !plan.can_run_without_interpreter_fallback() {
+                self.log(format_args!(
+                    "skip startup-profile pc=0x{:016x} count={} cause=interpreter-fallback",
+                    entry.pc, entry.count
+                ));
+                continue;
+            }
+
+            self.compile_plan(cpu, entry.pc, plan, tier, "startup-profile", 0)?;
+            compiled_blocks += 1;
+        }
+
+        self.precompiled_startup_profile = true;
+        self.log(format_args!(
+            "startup profile precompile complete blocks={compiled_blocks} cache_entries={}",
             self.cache.len()
         ));
         Ok(())
@@ -521,7 +785,9 @@ impl JitEngine {
             self.insert_host_libc_symbol(address, function);
         }
         for (address, name) in cpu.elf_plt_symbol_names() {
-            let Some(function) = host_libc_function_for_name(&name) else {
+            let Some(function) =
+                host_libc_function_for_plt_name(&name, self.options.host_libc_plt_stdio)
+            else {
                 continue;
             };
             self.insert_host_libc_symbol(address, function);
@@ -753,8 +1019,9 @@ impl JitEngine {
                 let end_pc = plan.end_pc;
                 let stop = plan.stop;
                 let code_len = block.code_len;
+                let native_entry = block.native_entry_address();
                 self.log(format_args!(
-                    "compile pc=0x{pc:016x} tier={tier} reason={reason} background=true end=0x{end_pc:016x} guest_instructions={instruction_count} emitted_operations={emitted_operations} code_bytes={code_len} stop={stop} optimizations={optimization_report}"
+                    "compile pc=0x{pc:016x} tier={tier} reason={reason} background=true native=0x{native_entry:016x} end=0x{end_pc:016x} guest_instructions={instruction_count} emitted_operations={emitted_operations} code_bytes={code_len} stop={stop} optimizations={optimization_report}"
                 ));
                 self.dump_block(&plan, &block, optimization_report);
                 if let Some(tracer) = cpu.tracer_mut() {
@@ -767,7 +1034,9 @@ impl JitEngine {
                     );
                     tracer.record_jit_background_adoption();
                 }
-                self.cache.insert(pc, block);
+                append_jit_map(pc, tier, native_entry, code_len, instruction_count);
+                self.cache.insert(pc, Box::new(block));
+                self.invalidate_dispatch_cache();
             }
             BackgroundCompileResult::PromotedWithoutCompile {
                 pc,
@@ -971,8 +1240,9 @@ impl JitEngine {
         block.execution_count = preserved_execution_count;
         block.next_optimized_attempt_count = preserved_execution_count;
         let code_len = block.code_len;
+        let native_entry = block.native_entry_address();
         self.log(format_args!(
-            "compile pc=0x{pc:016x} tier={tier} reason={reason} end=0x{end_pc:016x} guest_instructions={instruction_count} emitted_operations={emitted_operations} code_bytes={code_len} stop={stop} optimizations={optimization_report}"
+            "compile pc=0x{pc:016x} tier={tier} reason={reason} native=0x{native_entry:016x} end=0x{end_pc:016x} guest_instructions={instruction_count} emitted_operations={emitted_operations} code_bytes={code_len} stop={stop} optimizations={optimization_report}"
         ));
         self.dump_block(&plan, &block, optimization_report);
         if let Some(tracer) = cpu.tracer_mut() {
@@ -984,14 +1254,16 @@ impl JitEngine {
                 compile_duration,
             );
         }
-        self.cache.insert(pc, block);
+        append_jit_map(pc, tier, native_entry, code_len, instruction_count);
+        self.cache.insert(pc, Box::new(block));
+        self.invalidate_dispatch_cache();
 
         Ok(CompileOutcome::Compiled)
     }
 
     fn log(&self, args: fmt::Arguments<'_>) {
         if self.options.debug_log {
-            eprintln!("[jit] {args}");
+            debug::line(format_args!("[jit] {args}"));
         }
     }
 
@@ -1006,7 +1278,12 @@ impl JitEngine {
         }
 
         let start_pc = plan.fingerprint.first().map(|(pc, _)| *pc).unwrap_or(0);
-        eprintln!(
+        if let Some(filter_pc) = jit_dump_pc_filter() {
+            if start_pc != filter_pc {
+                return;
+            }
+        }
+        debug::line(format_args!(
             "[jit-dump] block pc=0x{start_pc:016x} tier={} end=0x{:016x} guest_instructions={} emitted_operations={} code_bytes={} stop={} optimizations={}",
             block.tier,
             plan.end_pc,
@@ -1015,23 +1292,319 @@ impl JitEngine {
             block.code_len,
             plan.stop,
             optimization_report
-        );
-        eprintln!("[jit-dump] rv64:");
+        ));
+        debug::line(format_args!("[jit-dump] rv64:"));
         for operation in &plan.operations {
-            eprintln!(
+            debug::line(format_args!(
                 "[jit-dump]   0x{:016x}: 0x{:08x}  {}",
                 operation.pc(),
                 operation.opcode(),
                 operation
-            );
+            ));
         }
-        eprintln!("[jit-dump] aarch64:");
+        debug::line(format_args!("[jit-dump] aarch64:"));
         for emission in &block.native_listing {
-            eprintln!(
+            debug::line(format_args!(
                 "[jit-dump]   +0x{:04x}: 0x{:08x}  {}",
                 emission.offset, emission.word, emission.text
-            );
+            ));
         }
+    }
+}
+
+fn jit_dump_pc_filter() -> Option<u64> {
+    static FILTER: OnceLock<Option<u64>> = OnceLock::new();
+    *FILTER.get_or_init(|| {
+        let raw = std::env::var("RISCVM_JIT_DUMP_PC").ok()?;
+        parse_u64_env_literal(raw.trim())
+    })
+}
+
+fn parse_u64_env_literal(value: &str) -> Option<u64> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn candidate_byte_scan_loop_from_cpu(cpu: &RV64GC, pc: u64) -> Option<CandidateByteScanLoop> {
+    let increment = lower_native_at(cpu, pc)?;
+    let NativeInstruction::Addi {
+        rd: index_register,
+        rs1: index_source,
+        imm: 1,
+    } = increment.instruction
+    else {
+        return None;
+    };
+    if index_register == 0 || index_source != index_register {
+        return None;
+    }
+
+    let shadow_copy = lower_native_at(cpu, increment.next_pc)?;
+    let (shadow_register, compare_offset_register) =
+        copy_instruction_registers(shadow_copy.instruction)?;
+
+    let loop_branch = lower_native_at(cpu, shadow_copy.next_pc)?;
+    let (rs1, rs2, head_pc, exhausted_pc) = match loop_branch.instruction {
+        NativeInstruction::Bne {
+            rs1,
+            rs2,
+            target: head_pc,
+            fallthrough: exhausted_pc,
+        } => (rs1, rs2, head_pc, exhausted_pc),
+        NativeInstruction::Beq {
+            rs1,
+            rs2,
+            target: exhausted_pc,
+            fallthrough: head_pc,
+        } => (rs1, rs2, head_pc, exhausted_pc),
+        _ => return None,
+    };
+    let limit_register = if rs1 == index_register {
+        rs2
+    } else if rs2 == index_register {
+        rs1
+    } else {
+        return None;
+    };
+    if limit_register == 0 || head_pc <= loop_branch.pc {
+        return None;
+    }
+
+    let scale = lower_native_at(cpu, head_pc)?;
+    let NativeInstruction::Slli {
+        rd: entry_address_register,
+        rs1: scaled_index_source,
+        shamt: 2,
+    } = scale.instruction
+    else {
+        return None;
+    };
+    if entry_address_register == 0 || scaled_index_source != index_register {
+        return None;
+    }
+
+    let table_add = lower_native_at(cpu, scale.next_pc)?;
+    let NativeInstruction::Add {
+        rd: table_entry_register,
+        rs1: table_lhs,
+        rs2: table_rhs,
+    } = table_add.instruction
+    else {
+        return None;
+    };
+    if table_entry_register != entry_address_register {
+        return None;
+    }
+    let table_base_register = if table_lhs == entry_address_register {
+        table_rhs
+    } else if table_rhs == entry_address_register {
+        table_lhs
+    } else {
+        return None;
+    };
+    if table_base_register == 0 {
+        return None;
+    }
+
+    let candidate_load = lower_native_at(cpu, table_add.next_pc)?;
+    let NativeInstruction::Load {
+        rd: candidate_offset_register,
+        rs1: candidate_load_base,
+        imm: 0,
+        width: MemoryWidth::Word,
+        signed: false,
+    } = candidate_load.instruction
+    else {
+        return None;
+    };
+    if candidate_offset_register == 0 || candidate_load_base != entry_address_register {
+        return None;
+    }
+
+    let candidate_add = lower_native_at(cpu, candidate_load.next_pc)?;
+    let NativeInstruction::Add {
+        rd: candidate_pointer_register,
+        rs1: candidate_lhs,
+        rs2: candidate_rhs,
+    } = candidate_add.instruction
+    else {
+        return None;
+    };
+    let candidate_base_register = if candidate_lhs == candidate_offset_register {
+        candidate_rhs
+    } else if candidate_rhs == candidate_offset_register {
+        candidate_lhs
+    } else {
+        return None;
+    };
+    if candidate_pointer_register == 0 || candidate_base_register == 0 {
+        return None;
+    }
+
+    let lhs_address_add = lower_native_at(cpu, candidate_add.next_pc)?;
+    let NativeInstruction::Add {
+        rd: lhs_address_register,
+        rs1: lhs_address_lhs,
+        rs2: lhs_address_rhs,
+    } = lhs_address_add.instruction
+    else {
+        return None;
+    };
+    if lhs_address_register == 0
+        || !((lhs_address_lhs == candidate_pointer_register
+            && lhs_address_rhs == compare_offset_register)
+            || (lhs_address_rhs == candidate_pointer_register
+                && lhs_address_lhs == compare_offset_register))
+    {
+        return None;
+    }
+
+    let rhs_address_add = lower_native_at(cpu, lhs_address_add.next_pc)?;
+    let NativeInstruction::Add {
+        rd: rhs_address_register,
+        rs1: rhs_address_lhs,
+        rs2: rhs_address_rhs,
+    } = rhs_address_add.instruction
+    else {
+        return None;
+    };
+    let rhs_base_register = if rhs_address_lhs == compare_offset_register {
+        rhs_address_rhs
+    } else if rhs_address_rhs == compare_offset_register {
+        rhs_address_lhs
+    } else {
+        return None;
+    };
+    if rhs_address_register == 0 || rhs_base_register == 0 {
+        return None;
+    }
+
+    let lhs_load = lower_native_at(cpu, rhs_address_add.next_pc)?;
+    let NativeInstruction::Load {
+        rd: lhs_value_register,
+        rs1: lhs_load_base,
+        imm: 0,
+        width: MemoryWidth::Byte,
+        signed: false,
+    } = lhs_load.instruction
+    else {
+        return None;
+    };
+    if lhs_value_register == 0 || lhs_load_base != lhs_address_register {
+        return None;
+    }
+
+    let rhs_load = lower_native_at(cpu, lhs_load.next_pc)?;
+    let NativeInstruction::Load {
+        rd: rhs_value_register,
+        rs1: rhs_load_base,
+        imm: 0,
+        width: MemoryWidth::Byte,
+        signed: false,
+    } = rhs_load.instruction
+    else {
+        return None;
+    };
+    if rhs_value_register == 0 || rhs_load_base != rhs_address_register {
+        return None;
+    }
+
+    let compare_branch = lower_native_at(cpu, rhs_load.next_pc)?;
+    let NativeInstruction::Bne {
+        rs1: compare_lhs,
+        rs2: compare_rhs,
+        target: loop_pc,
+        fallthrough: match_pc,
+    } = compare_branch.instruction
+    else {
+        return None;
+    };
+    if loop_pc != pc
+        || !((compare_lhs == lhs_value_register && compare_rhs == rhs_value_register)
+            || (compare_lhs == rhs_value_register && compare_rhs == lhs_value_register))
+    {
+        return None;
+    }
+
+    Some(CandidateByteScanLoop {
+        index_register,
+        shadow_register,
+        compare_offset_register,
+        limit_register,
+        exhausted_pc,
+        table_base_register,
+        entry_address_register,
+        candidate_offset_register,
+        candidate_base_register,
+        candidate_pointer_register,
+        lhs_address_register,
+        rhs_address_register,
+        rhs_base_register,
+        lhs_value_register,
+        rhs_value_register,
+        match_pc,
+    })
+}
+
+fn execute_candidate_byte_scan_loop(
+    cpu: &mut RV64GC,
+    pattern: CandidateByteScanLoop,
+) -> Option<u64> {
+    let mut executed = 0u64;
+    loop {
+        let index = cpu.registers[pattern.index_register as usize].wrapping_add(1);
+        cpu.registers[pattern.index_register as usize] = index;
+        cpu.registers[pattern.shadow_register as usize] =
+            cpu.registers[pattern.compare_offset_register as usize];
+        executed = executed.saturating_add(3);
+
+        if index == cpu.registers[pattern.limit_register as usize] {
+            cpu.registers[Pc] = pattern.exhausted_pc;
+            cpu.registers[Zero] = 0;
+            return Some(executed);
+        }
+
+        let table_entry =
+            cpu.registers[pattern.table_base_register as usize].wrapping_add(index << 2);
+        let candidate_offset = u64::from(cpu.ram.read_u32_cached(table_entry).ok()?);
+        let candidate_pointer =
+            cpu.registers[pattern.candidate_base_register as usize].wrapping_add(candidate_offset);
+        let compare_offset = cpu.registers[pattern.compare_offset_register as usize];
+        let lhs_address = candidate_pointer.wrapping_add(compare_offset);
+        let rhs_address =
+            cpu.registers[pattern.rhs_base_register as usize].wrapping_add(compare_offset);
+        let lhs_value = u64::from(cpu.ram.read_u8_cached(lhs_address).ok()?);
+        let rhs_value = u64::from(cpu.ram.read_u8_cached(rhs_address).ok()?);
+
+        cpu.registers[pattern.entry_address_register as usize] = table_entry;
+        cpu.registers[pattern.candidate_offset_register as usize] = candidate_offset;
+        cpu.registers[pattern.candidate_pointer_register as usize] = candidate_pointer;
+        cpu.registers[pattern.lhs_address_register as usize] = lhs_address;
+        cpu.registers[pattern.rhs_address_register as usize] = rhs_address;
+        cpu.registers[pattern.lhs_value_register as usize] = lhs_value;
+        cpu.registers[pattern.rhs_value_register as usize] = rhs_value;
+        executed = executed.saturating_add(9);
+
+        if lhs_value == rhs_value {
+            cpu.registers[Pc] = pattern.match_pc;
+            cpu.registers[Zero] = 0;
+            return Some(executed);
+        }
+    }
+}
+
+fn copy_instruction_registers(instruction: NativeInstruction) -> Option<(u8, u8)> {
+    match instruction {
+        NativeInstruction::Addi { rd, rs1, imm: 0 } if rd != 0 => Some((rd, rs1)),
+        NativeInstruction::Add { rd, rs1, rs2 } if rd != 0 && rs1 == 0 => Some((rd, rs2)),
+        NativeInstruction::Add { rd, rs1, rs2 } if rd != 0 && rs2 == 0 => Some((rd, rs1)),
+        _ => None,
     }
 }
 
@@ -1046,7 +1619,9 @@ fn execute_compiled_block(
     let code_len = block.code_len;
     let tier = block.tier;
     if options.debug_log {
-        eprintln!("[jit] execute pc=0x{pc:016x} tier={tier} instructions={instructions}");
+        debug::line(format_args!(
+            "[jit] execute pc=0x{pc:016x} tier={tier} instructions={instructions}"
+        ));
     }
     let execute_start = cpu.tracer_enabled().then(Instant::now);
     let executed_instructions = block.execute(cpu);
@@ -1056,10 +1631,10 @@ fn execute_compiled_block(
     }
     block.execution_count = block.execution_count.saturating_add(1);
     if options.debug_log {
-        eprintln!(
+        debug::line(format_args!(
             "[jit] execute complete pc=0x{pc:016x} tier={tier} next_pc=0x{:016x}",
             cpu.registers[Pc]
-        );
+        ));
     }
     let next_pc = cpu.registers[Pc];
     if let Some(tracer) = cpu.tracer_mut() {
@@ -1081,6 +1656,22 @@ fn execute_compiled_block(
         pc,
         instructions: executed_instructions,
     })
+}
+
+#[inline(always)]
+fn execute_compiled_block_fast(
+    cpu: &mut RV64GC,
+    pc: u64,
+    block: &mut CompiledBlock,
+) -> Result<(), JitError> {
+    block.execute(cpu);
+    if let Some(reason) = cpu.take_jit_runtime_fault() {
+        return Err(JitError::RuntimeFault { pc, reason });
+    }
+    if block.tier == JitTier::Baseline {
+        block.execution_count = block.execution_count.saturating_add(1);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1111,6 +1702,18 @@ fn aot_runtime_plan_should_optimize(plan: &BlockPlan) -> bool {
     plan.contains_compiler_region()
         || plan.ends_with_self_loop_branch()
         || plan.ends_with_loop_back_edge()
+}
+
+fn startup_profile_plan_for_tier(
+    cpu: &RV64GC,
+    pc: u64,
+    options: JitOptions,
+) -> (BlockPlanResult, JitTier) {
+    if options.execution_mode == JitExecutionMode::Aot {
+        return aot_precompile_plan_for_tier(cpu, pc, options);
+    }
+
+    (BlockPlan::from_cpu(cpu, pc), JitTier::Baseline)
 }
 
 fn aot_precompile_plan_for_tier(
@@ -1162,19 +1765,7 @@ fn aot_trace_plan_should_optimize(plan: &BlockPlan) -> bool {
 
 fn plan_for_tier(cpu: &RV64GC, pc: u64, tier: JitTier) -> (BlockPlanResult, JitTier) {
     match tier {
-        JitTier::Baseline => {
-            let planned = BlockPlan::optimized_from_cpu(cpu, pc);
-            let tier = if planned
-                .plan
-                .as_ref()
-                .is_some_and(BlockPlan::contains_compiler_region)
-            {
-                JitTier::Optimized
-            } else {
-                JitTier::Baseline
-            };
-            (planned, tier)
-        }
+        JitTier::Baseline => (BlockPlan::from_cpu(cpu, pc), JitTier::Baseline),
         JitTier::Optimized => (BlockPlan::optimized_from_cpu(cpu, pc), JitTier::Optimized),
         JitTier::Trace => {
             let optimized = BlockPlan::optimized_from_cpu(cpu, pc);
@@ -1199,7 +1790,6 @@ fn plan_for_tier(cpu: &RV64GC, pc: u64, tier: JitTier) -> (BlockPlanResult, JitT
 fn host_libc_function_for_name(name: &str) -> Option<HostLibcFunction> {
     match name {
         "exit" | "__GI_exit" => Some(HostLibcFunction::Exit),
-        "__libc_start_main" => Some(HostLibcFunction::LibcStartMain),
         "memcmp" | "__memcmp" => Some(HostLibcFunction::Memcmp),
         "memcpy" | "__memcpy" | "__memcpy_generic" => Some(HostLibcFunction::Memcpy),
         "memmove" | "__memmove" => Some(HostLibcFunction::Memmove),
@@ -1210,6 +1800,17 @@ fn host_libc_function_for_name(name: &str) -> Option<HostLibcFunction> {
         "strlen" | "__strlen" | "__strlen_generic" => Some(HostLibcFunction::Strlen),
         "strncmp" | "__strncmp" => Some(HostLibcFunction::Strncmp),
         _ => None,
+    }
+}
+
+fn host_libc_function_for_plt_name(name: &str, allow_stdio: bool) -> Option<HostLibcFunction> {
+    match host_libc_function_for_name(name) {
+        Some(HostLibcFunction::Exit | HostLibcFunction::Printf | HostLibcFunction::Puts)
+            if !allow_stdio =>
+        {
+            None
+        }
+        function => function,
     }
 }
 
@@ -1226,13 +1827,14 @@ fn host_libc_function_for_defined_symbol(name: &str) -> Option<HostLibcFunction>
 }
 
 fn host_libc_start_main_shortcut_for_defined_symbol(name: &str) -> Option<HostLibcFunction> {
+    if name == "__libc_start_main" {
+        return Some(HostLibcFunction::LibcStartMain);
+    }
+
     match host_libc_function_for_name(name) {
-        Some(
-            HostLibcFunction::Exit
-            | HostLibcFunction::LibcStartMain
-            | HostLibcFunction::Printf
-            | HostLibcFunction::Puts,
-        ) => host_libc_function_for_name(name),
+        Some(HostLibcFunction::Exit | HostLibcFunction::Printf | HostLibcFunction::Puts) => {
+            host_libc_function_for_name(name)
+        }
         _ => None,
     }
 }
@@ -1801,6 +2403,57 @@ fn optimized_tier_decision(block: &CompiledBlock, options: JitOptions) -> Optimi
     }
 }
 
+fn block_needs_compile_check(block: &CompiledBlock, options: JitOptions) -> bool {
+    options.dynamic_recompilation
+        && block.tier == JitTier::Baseline
+        && block.execution_count >= options.hot_threshold
+        && block.execution_count >= block.next_optimized_attempt_count
+}
+
+fn dispatch_cache_slot(pc: u64) -> usize {
+    debug_assert!(DISPATCH_CACHE_ENTRIES.is_power_of_two());
+    ((pc >> 1) as usize) & (DISPATCH_CACHE_ENTRIES - 1)
+}
+
+fn candidate_byte_scan_cache_slot(pc: u64) -> usize {
+    debug_assert!(CANDIDATE_BYTE_SCAN_CACHE_ENTRIES.is_power_of_two());
+    ((pc >> 1) as usize) & (CANDIDATE_BYTE_SCAN_CACHE_ENTRIES - 1)
+}
+
+fn append_jit_map(
+    pc: u64,
+    tier: JitTier,
+    native_entry: usize,
+    code_len: usize,
+    instruction_count: usize,
+) {
+    let Some(file) = jit_map_file() else {
+        return;
+    };
+    let Ok(mut file) = file.lock() else { return };
+    let _ = writeln!(
+        file,
+        "0x{native_entry:016x}\t0x{:016x}\t0x{pc:016x}\t{tier}\t{instruction_count}",
+        native_entry.saturating_add(code_len)
+    );
+}
+
+fn jit_map_file() -> Option<&'static Mutex<File>> {
+    static JIT_MAP_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+
+    JIT_MAP_FILE
+        .get_or_init(|| {
+            let path = std::env::var_os("RISCVM_JIT_MAP")?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
 pub(super) struct PreparedPlan {
     pub plan: BlockPlan,
     pub optimization_report: OptimizationReport,
@@ -1820,6 +2473,17 @@ pub(super) fn prepare_plan_for_tier(plan: BlockPlan, tier: JitTier) -> PreparedP
             plan: optimized,
             optimization_report: report,
             skipped_compile,
+        };
+    }
+
+    if tier == JitTier::Baseline
+        && plan.guest_instruction_count >= BASELINE_OPTIMIZER_MIN_INSTRUCTIONS
+    {
+        let (optimized, report) = optimize_plan(&plan);
+        return PreparedPlan {
+            plan: optimized,
+            optimization_report: report,
+            skipped_compile: false,
         };
     }
 
@@ -1850,6 +2514,10 @@ impl CompiledBlock {
         self.native.execute(cpu)
     }
 
+    fn native_entry_address(&self) -> usize {
+        self.native.entry_address()
+    }
+
     fn is_stale(&mut self, cpu: &RV64GC) -> bool {
         let current_code_version = cpu.ram.code_version();
         if self.code_version == current_code_version {
@@ -1876,6 +2544,10 @@ pub(crate) struct NativeBlock;
 
 #[cfg(not(all(target_arch = "aarch64", unix)))]
 impl NativeBlock {
+    fn entry_address(&self) -> usize {
+        0
+    }
+
     fn execute(&self, _cpu: &mut RV64GC) -> u64 {
         0
     }
@@ -2774,8 +3446,6 @@ impl BlockPlan {
     }
 
     fn can_use_register_allocated_optimized_block(&self) -> bool {
-        const MAX_REGALLOC_GUEST_REGISTERS: usize = 16;
-
         let mut guest_registers = Vec::new();
         for operation in &self.operations {
             let BlockOperationKind::Native(instruction) = operation.kind();
@@ -2964,6 +3634,7 @@ fn collect_regalloc_candidate_registers(
         | NativeInstruction::AndBranch { rd, rs1, .. }
         | NativeInstruction::Andi { rd, rs1, .. }
         | NativeInstruction::Ori { rd, rs1, .. }
+        | NativeInstruction::ShiftedWordOr { rd, rs1, .. }
         | NativeInstruction::Slli { rd, rs1, .. }
         | NativeInstruction::Slliw { rd, rs1, .. }
         | NativeInstruction::Slti { rd, rs1, .. }
@@ -3027,6 +3698,7 @@ fn collect_regalloc_candidate_registers(
         }
         NativeInstruction::Ecall { .. }
         | NativeInstruction::ArithmeticXorToggleLoop(_)
+        | NativeInstruction::ByteCopy8 { .. }
         | NativeInstruction::CountedDiamondLoop(_)
         | NativeInstruction::DivisionRecurrenceLoop(_)
         | NativeInstruction::FibonacciRecurrenceLoop(_)
@@ -3588,6 +4260,13 @@ pub(crate) enum NativeInstruction {
         target: u64,
         fallthrough: u64,
     },
+    ByteCopy8 {
+        registers: [u8; 8],
+        load_base: u8,
+        load_imm: i64,
+        store_base: u8,
+        store_imm: i64,
+    },
     ArithmeticXorToggleLoop(ArithmeticXorToggleLoop),
     CountedDiamondLoop(CountedDiamondLoop),
     DivisionRecurrenceLoop(DivisionRecurrenceLoop),
@@ -3698,6 +4377,12 @@ pub(crate) enum NativeInstruction {
         rd: u8,
         rs1: u8,
         shamt: u32,
+    },
+    ShiftedWordOr {
+        rd: u8,
+        rs1: u8,
+        left_shamt: u32,
+        right_shamt: u32,
     },
     Slliw {
         rd: u8,
@@ -4551,6 +5236,22 @@ impl NativeInstruction {
                 rs3: Zero as u8,
                 op: RuntimeFloatOp::CvtWuD,
             }),
+            RV64GCInstruction::Fcvtld(rd, rm, rs1) => Some(Self::RuntimeFloat {
+                rd,
+                rm,
+                rs1,
+                rs2: Zero as u8,
+                rs3: Zero as u8,
+                op: RuntimeFloatOp::CvtLD,
+            }),
+            RV64GCInstruction::Fcvtlud(rd, rm, rs1) => Some(Self::RuntimeFloat {
+                rd,
+                rm,
+                rs1,
+                rs2: Zero as u8,
+                rs3: Zero as u8,
+                op: RuntimeFloatOp::CvtLuD,
+            }),
             RV64GCInstruction::Fcvtdw(rd, rm, rs1) => Some(Self::RuntimeFloat {
                 rd,
                 rm,
@@ -4567,6 +5268,22 @@ impl NativeInstruction {
                 rs3: Zero as u8,
                 op: RuntimeFloatOp::CvtDWu,
             }),
+            RV64GCInstruction::Fcvtdl(rd, rm, rs1) => Some(Self::RuntimeFloat {
+                rd,
+                rm,
+                rs1,
+                rs2: Zero as u8,
+                rs3: Zero as u8,
+                op: RuntimeFloatOp::CvtDL,
+            }),
+            RV64GCInstruction::Fcvtdlu(rd, rm, rs1) => Some(Self::RuntimeFloat {
+                rd,
+                rm,
+                rs1,
+                rs2: Zero as u8,
+                rs3: Zero as u8,
+                op: RuntimeFloatOp::CvtDLu,
+            }),
             RV64GCInstruction::Fmvxd(rd, rs1) => Some(Self::RuntimeFloat {
                 rd,
                 rm: 0,
@@ -4574,6 +5291,14 @@ impl NativeInstruction {
                 rs2: Zero as u8,
                 rs3: Zero as u8,
                 op: RuntimeFloatOp::MvXD,
+            }),
+            RV64GCInstruction::Fmvdx(rd, rs1) => Some(Self::RuntimeFloat {
+                rd,
+                rm: 0,
+                rs1,
+                rs2: Zero as u8,
+                rs3: Zero as u8,
+                op: RuntimeFloatOp::MvDX,
             }),
             RV64GCInstruction::Jal(rd, imm) => Some(Self::Jal {
                 rd,
@@ -4985,6 +5710,16 @@ impl fmt::Display for NativeInstruction {
             } => {
                 write!(f, "bne x{rs1}, x{rs2}, target=0x{target:016x}")
             }
+            Self::ByteCopy8 {
+                registers,
+                load_base,
+                load_imm,
+                store_base,
+                store_imm,
+            } => write!(
+                f,
+                "byte-copy8 regs={registers:?}, {load_imm}(x{load_base}) -> {store_imm}(x{store_base})"
+            ),
             Self::ArithmeticXorToggleLoop(region) => write!(
                 f,
                 "arithmetic-xor-toggle-loop counter=x{} acc=x{} value=x{} xor={} exit=0x{:016x}",
@@ -5073,6 +5808,15 @@ impl fmt::Display for NativeInstruction {
             Self::Ori { rd, rs1, imm } => write!(f, "ori x{rd}, x{rs1}, {imm}"),
             Self::Sll { rd, rs1, rs2 } => write!(f, "sll x{rd}, x{rs1}, x{rs2}"),
             Self::Slli { rd, rs1, shamt } => write!(f, "slli x{rd}, x{rs1}, {shamt}"),
+            Self::ShiftedWordOr {
+                rd,
+                rs1,
+                left_shamt,
+                right_shamt,
+            } => write!(
+                f,
+                "shifted-word-or x{rd}, x{rs1}, left={left_shamt}, rightw={right_shamt}"
+            ),
             Self::Slliw { rd, rs1, shamt } => write!(f, "slliw x{rd}, x{rs1}, {shamt}"),
             Self::Sllw { rd, rs1, rs2 } => write!(f, "sllw x{rd}, x{rs1}, x{rs2}"),
             Self::Slt { rd, rs1, rs2 } => write!(f, "slt x{rd}, x{rs1}, x{rs2}"),
@@ -5500,10 +6244,7 @@ mod tests {
 
     #[test]
     fn host_libc_resolves_dynamic_runtime_symbols() {
-        assert_eq!(
-            host_libc_function_for_name("__libc_start_main"),
-            Some(HostLibcFunction::LibcStartMain)
-        );
+        assert_eq!(host_libc_function_for_name("__libc_start_main"), None);
         assert_eq!(
             host_libc_function_for_name("printf"),
             Some(HostLibcFunction::Printf)
@@ -5513,6 +6254,21 @@ mod tests {
             Some(HostLibcFunction::Puts)
         );
         assert_eq!(host_libc_function_for_name("malloc"), None);
+    }
+
+    #[test]
+    fn host_libc_can_disable_plt_stdio_shortcuts() {
+        assert_eq!(
+            host_libc_function_for_plt_name("memcpy", false),
+            Some(HostLibcFunction::Memcpy)
+        );
+        assert_eq!(host_libc_function_for_plt_name("printf", false), None);
+        assert_eq!(host_libc_function_for_plt_name("puts", false), None);
+        assert_eq!(host_libc_function_for_plt_name("exit", false), None);
+        assert_eq!(
+            host_libc_function_for_plt_name("puts", true),
+            Some(HostLibcFunction::Puts)
+        );
     }
 
     #[test]
@@ -5684,7 +6440,7 @@ mod tests {
         assert!(!JitOptions::default().libc_start_main_shortcut);
         assert!(JitOptions::default().dynamic_recompilation);
         assert!(JitOptions::default().trace_compilation);
-        assert_eq!(JitOptions::default().hot_threshold, 1);
+        assert_eq!(JitOptions::default().hot_threshold, 8);
         assert!(JitOptions::default().tier_budgeting);
         assert_eq!(
             JitOptions::default().non_loop_hot_threshold_multiplier,
@@ -5697,6 +6453,48 @@ mod tests {
         assert!(JitOptions::default().aot_compile_misses);
         assert!(!JitOptions::default().aot_symbol_entries);
         assert!(!JitOptions::default().aot_linear_sweep);
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn jit_caches_negative_byte_scan_candidates() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(rv64_word(0x0000_0013).to_vec());
+        let mut engine = JitEngine::new().unwrap();
+
+        assert_eq!(engine.try_candidate_byte_scan_loop(&mut cpu, 0), None);
+
+        let entry = engine.candidate_byte_scan_cache[candidate_byte_scan_cache_slot(0)];
+        assert_eq!(entry.pc, 0);
+        assert_eq!(entry.code_version, cpu.ram.code_version());
+        assert!(matches!(
+            entry.result,
+            CandidateByteScanCacheResult::NotCandidate
+        ));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn jit_startup_profile_precompiles_profiled_blocks() {
+        let mut bin = Vec::new();
+        bin.extend(rv64_word(rv64_beq(0, 0, 8))); // beq x0, x0, +8
+        bin.extend(rv64_word(0x0000_0013)); // addi x0, x0, 0
+        bin.extend(rv64_word(0x0010_0113)); // addi x2, x0, 1
+
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(bin);
+
+        let mut engine = JitEngine::with_startup_profile(
+            JitOptions::default(),
+            [JitStartupProfileEntry::new(8, 10)],
+        )
+        .unwrap();
+
+        engine.step(&mut cpu).unwrap();
+
+        let profiled = engine.cache.get(&8).expect("profiled block");
+        assert_eq!(profiled.tier, JitTier::Baseline);
+        assert_eq!(cpu.registers[Pc], 8);
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]
@@ -6388,6 +7186,7 @@ mod tests {
         bin.extend(rv64_word(rv64_r(0x53, 0, 0x21, 7, 3, 0))); // fcvt.d.s f7, f3
         bin.extend(rv64_word(rv64_r(0x53, 0, 0x71, 8, 2, 0))); // fmv.x.d x8, f2
         bin.extend(rv64_word(rv64_i(0x07, 3, 9, 9, 0))); // fld f9, 0(x9)
+        bin.extend(rv64_word(rv64_r(0x53, 0, 0x79, 10, 10, 0))); // fmv.d.x f10, x10
 
         let mut cpu = RV64GC::new();
         cpu.load_bin(bin);
@@ -6402,6 +7201,7 @@ mod tests {
         cpu.float_registers[1usize] = 1.5f64.to_bits();
         cpu.float_registers[2usize] = (-2.0f64).to_bits();
         cpu.float_registers[3usize] = 0xffff_ffff_0000_0000 | u64::from(1.25f32.to_bits());
+        cpu.registers[10usize] = 3.5f64.to_bits();
 
         let mut engine = JitEngine::with_options(JitOptions {
             execution_mode: JitExecutionMode::Jit,
@@ -6414,7 +7214,7 @@ mod tests {
             step,
             JitStep::Native {
                 pc: 0,
-                instructions: 6
+                instructions: 7
             }
         );
         assert_eq!(cpu.float_registers[4usize], (-1.5f64).to_bits());
@@ -6423,7 +7223,8 @@ mod tests {
         assert_eq!(cpu.float_registers[7usize], 1.25f64.to_bits());
         assert_eq!(cpu.registers[8usize], (-2.0f64).to_bits());
         assert_eq!(cpu.float_registers[9usize], 4.25f64.to_bits());
-        assert_eq!(cpu.registers[Pc], 24);
+        assert_eq!(cpu.float_registers[10usize], 3.5f64.to_bits());
+        assert_eq!(cpu.registers[Pc], 28);
         assert!(!engine
             .cache
             .get(&0)
@@ -6453,6 +7254,10 @@ mod tests {
         bin.extend(rv64_word(rv64_r(0x53, 1, 0x61, 23, 1, 1))); // fcvt.wu.d x23, f1
         bin.extend(rv64_word(rv64_r(0x53, 0, 0x69, 24, 24, 0))); // fcvt.d.w f24, x24
         bin.extend(rv64_word(rv64_r(0x53, 0, 0x69, 25, 25, 1))); // fcvt.d.wu f25, x25
+        bin.extend(rv64_word(rv64_r(0x53, 1, 0x61, 30, 5, 2))); // fcvt.l.d x30, f5
+        bin.extend(rv64_word(rv64_r(0x53, 1, 0x61, 31, 1, 3))); // fcvt.lu.d x31, f1
+        bin.extend(rv64_word(rv64_r(0x53, 0, 0x69, 30, 24, 2))); // fcvt.d.l f30, x24
+        bin.extend(rv64_word(rv64_r(0x53, 0, 0x69, 31, 25, 3))); // fcvt.d.lu f31, x25
         bin.extend(rv64_word(rv64_r4_fmt(0x43, 1, 0, 26, 1, 2, 3))); // fmadd.d
         bin.extend(rv64_word(rv64_r4_fmt(0x47, 1, 0, 27, 1, 2, 3))); // fmsub.d
         bin.extend(rv64_word(rv64_r4_fmt(0x4f, 1, 0, 28, 1, 2, 3))); // fnmadd.d
@@ -6479,7 +7284,7 @@ mod tests {
             step,
             JitStep::Native {
                 pc: 0,
-                instructions: 20
+                instructions: 24
             }
         );
         assert_eq!(cpu.float_registers[10usize], 8.0f64.to_bits());
@@ -6498,11 +7303,15 @@ mod tests {
         assert_eq!(cpu.registers[23usize], 6);
         assert_eq!(cpu.float_registers[24usize], (-7.0f64).to_bits());
         assert_eq!(cpu.float_registers[25usize], 7.0f64.to_bits());
+        assert_eq!(cpu.registers[30usize], (-2i64) as u64);
+        assert_eq!(cpu.registers[31usize], 6);
         assert_eq!(cpu.float_registers[26usize], 13.5f64.to_bits());
         assert_eq!(cpu.float_registers[27usize], 10.5f64.to_bits());
         assert_eq!(cpu.float_registers[28usize], (-13.5f64).to_bits());
         assert_eq!(cpu.float_registers[29usize], (-10.5f64).to_bits());
-        assert_eq!(cpu.registers[Pc], 80);
+        assert_eq!(cpu.float_registers[30usize], (-7.0f64).to_bits());
+        assert_eq!(cpu.float_registers[31usize], 7.0f64.to_bits());
+        assert_eq!(cpu.registers[Pc], 96);
         assert!(!engine
             .cache
             .get(&0)
@@ -7336,7 +8145,7 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", unix))]
     #[test]
-    fn jit_uses_fibonacci_recurrence_loop_region_on_first_entry() {
+    fn jit_uses_fibonacci_recurrence_loop_region_after_hot_reentry() {
         let mut cpu = RV64GC::new();
         cpu.load_bin(fibonacci_recurrence_loop_bin());
         cpu.registers[11usize] = 1;
@@ -7347,6 +8156,7 @@ mod tests {
 
         let mut engine = JitEngine::with_options(JitOptions {
             dump_instructions: true,
+            hot_threshold: 1,
             ..JitOptions::default()
         })
         .unwrap();
@@ -7355,9 +8165,29 @@ mod tests {
             engine.step(&mut cpu).unwrap(),
             JitStep::Native {
                 pc: 0,
-                instructions: 30,
+                instructions: 6,
             }
         );
+        assert_eq!(cpu.registers[12usize], 4);
+        assert_eq!(cpu.registers[Pc], 0);
+        assert_eq!(engine.cache.get(&0).unwrap().tier, JitTier::Baseline);
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 24,
+            }
+        );
+        let (expected_current, expected_previous, expected_checksum) =
+            expected_fibonacci_recurrence(5);
+        assert_eq!(cpu.registers[11usize], expected_previous);
+        assert_eq!(cpu.registers[12usize], 0);
+        assert_eq!(cpu.registers[13usize], expected_checksum);
+        assert_eq!(cpu.registers[14usize], expected_previous);
+        assert_eq!(cpu.registers[15usize], expected_current);
+        assert_eq!(cpu.registers[Pc], 24);
+
         let block = engine.cache.get(&0).unwrap();
         assert_eq!(block.tier, JitTier::Optimized);
         assert!(block
@@ -7730,8 +8560,56 @@ mod tests {
             .map(|emission| emission.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(listing.contains("ldr q0"));
+        assert!(listing.contains("cmeq v0.16b"));
+        assert!(listing.contains("umaxv b0"));
         assert!(listing.contains("ldrb w"));
         assert!(listing.contains("direct_trace_load_side_exit"));
+    }
+
+    #[cfg(all(target_arch = "aarch64", unix))]
+    #[test]
+    fn trace_jit_direct_byte_load_loop_completes_vector_chunk() {
+        let mut cpu = RV64GC::new();
+        cpu.load_bin(trace_byte_memory_branch_loop_bin());
+        cpu.ram
+            .add_region(MemoryRegion::new(0x1000, 16, (1u8..=16).collect()))
+            .unwrap();
+        cpu.registers[5usize] = 16;
+        cpu.registers[10usize] = 0x1000;
+
+        let mut engine = JitEngine::with_options(JitOptions {
+            trace_compilation: true,
+            dump_instructions: true,
+            ..JitOptions::default()
+        })
+        .unwrap();
+        engine
+            .compile_block(&mut cpu, 0, JitTier::Trace, "test", 0)
+            .unwrap();
+
+        assert_eq!(
+            engine.step(&mut cpu).unwrap(),
+            JitStep::Native {
+                pc: 0,
+                instructions: 80,
+            }
+        );
+        assert_eq!(cpu.registers[5usize], 16);
+        assert_eq!(cpu.registers[6usize], 16);
+        assert_eq!(cpu.registers[7usize], 16);
+        assert_eq!(cpu.registers[10usize], 0x1010);
+        assert_eq!(cpu.registers[Pc], 20);
+
+        let listing = engine.cache[&0]
+            .native_listing
+            .iter()
+            .map(|emission| emission.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(listing.contains("direct trace vector load"));
+        assert!(listing.contains("direct trace vector final load"));
+        assert!(listing.contains("direct_trace_load_vector_loop"));
     }
 
     #[cfg(all(target_arch = "aarch64", unix))]

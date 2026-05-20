@@ -3,6 +3,7 @@ use std::fmt::Display;
 use thiserror::Error;
 pub const PAGE_SIZE: u64 = 4096;
 const MMAP_BASE: u64 = 0x4000_0000;
+pub(crate) const JIT_FAST_CACHE_ENTRIES: usize = 8;
 
 pub fn align_up(addr: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
@@ -13,12 +14,59 @@ pub fn align_up(addr: u64, align: u64) -> u64 {
 pub struct Ram {
     regions: Vec<MemoryRegion>,
     cached_region_index: Option<usize>,
+    cached_region_indices: [Option<usize>; JIT_FAST_CACHE_ENTRIES],
+    jit_fast_caches: [JitFastMemoryCache; JIT_FAST_CACHE_ENTRIES],
     pub lowest_unalloced_addr: u64,
     program_break: u64,
     heap_start: u64,
     next_mmap_addr: u64,
     code_version: u64,
 }
+
+impl Clone for Ram {
+    fn clone(&self) -> Self {
+        Self {
+            regions: self.regions.clone(),
+            cached_region_index: None,
+            cached_region_indices: [None; JIT_FAST_CACHE_ENTRIES],
+            jit_fast_caches: [JitFastMemoryCache::default(); JIT_FAST_CACHE_ENTRIES],
+            lowest_unalloced_addr: self.lowest_unalloced_addr,
+            program_break: self.program_break,
+            heap_start: self.heap_start,
+            next_mmap_addr: self.next_mmap_addr,
+            code_version: self.code_version,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JitFastMemoryCache {
+    pub start: u64,
+    pub end: u64,
+    pub read_ptr: *const u8,
+    pub write_ptr: *mut u8,
+}
+
+impl Default for JitFastMemoryCache {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            read_ptr: std::ptr::null(),
+            write_ptr: std::ptr::null_mut(),
+        }
+    }
+}
+
+pub(crate) const RAM_JIT_FAST_CACHES_OFFSET: usize = std::mem::offset_of!(Ram, jit_fast_caches);
+pub(crate) const JIT_FAST_CACHE_START_OFFSET: usize =
+    std::mem::offset_of!(JitFastMemoryCache, start);
+pub(crate) const JIT_FAST_CACHE_END_OFFSET: usize = std::mem::offset_of!(JitFastMemoryCache, end);
+pub(crate) const JIT_FAST_CACHE_READ_PTR_OFFSET: usize =
+    std::mem::offset_of!(JitFastMemoryCache, read_ptr);
+pub(crate) const JIT_FAST_CACHE_WRITE_PTR_OFFSET: usize =
+    std::mem::offset_of!(JitFastMemoryCache, write_ptr);
 
 impl Default for Ram {
     fn default() -> Self {
@@ -31,6 +79,8 @@ impl Ram {
         Ram {
             regions: Vec::new(),
             cached_region_index: None,
+            cached_region_indices: [None; JIT_FAST_CACHE_ENTRIES],
+            jit_fast_caches: [JitFastMemoryCache::default(); JIT_FAST_CACHE_ENTRIES],
             lowest_unalloced_addr: 0,
             program_break: 0,
             heap_start: 0,
@@ -71,12 +121,35 @@ impl Ram {
 
         // Insert the region at the correct position
         self.regions.insert(index, region);
-        self.cached_region_index = None;
+        self.invalidate_fast_cache();
         if changes_code {
             self.bump_code_version();
         }
 
         Ok(())
+    }
+
+    pub fn copy_data_from(&mut self, other: &Ram) {
+        for other_region in &other.regions {
+            if let Some(region) = self
+                .regions
+                .iter_mut()
+                .find(|region| region.start == other_region.start)
+            {
+                region.size = other_region.size;
+                region.flags = other_region.flags;
+                region.data.clone_from(&other_region.data);
+            } else {
+                self.regions.push(other_region.clone());
+            }
+        }
+        self.lowest_unalloced_addr = other.lowest_unalloced_addr;
+        self.program_break = other.program_break;
+        self.heap_start = other.heap_start;
+        self.next_mmap_addr = other.next_mmap_addr;
+        self.code_version = other.code_version;
+        self.regions.sort_by_key(|region| region.start);
+        self.invalidate_fast_cache();
     }
 
     pub fn extend_region(&mut self, addr: u64, addition: u64) -> Result<(), MemoryError> {
@@ -92,6 +165,7 @@ impl Ram {
             region.extend(addition);
             region.end()
         };
+        self.invalidate_fast_cache();
         if new_end > self.lowest_unalloced_addr {
             self.lowest_unalloced_addr = new_end;
         }
@@ -132,6 +206,7 @@ impl Ram {
                 }
 
                 self.regions[idx].extend(addr - current_end);
+                self.invalidate_fast_cache();
                 if self.regions[idx].end() > self.lowest_unalloced_addr {
                     self.lowest_unalloced_addr = self.regions[idx].end();
                 }
@@ -153,12 +228,58 @@ impl Ram {
         requested_addr: Option<u64>,
         len: u64,
     ) -> Result<u64, MemoryError> {
+        self.mmap_anonymous_with_flags(requested_addr, len, 0, false)
+    }
+
+    pub fn mmap_anonymous_with_flags(
+        &mut self,
+        requested_addr: Option<u64>,
+        len: u64,
+        flags: u64,
+        replace: bool,
+    ) -> Result<u64, MemoryError> {
         let len = align_up(len, PAGE_SIZE);
         let addr = requested_addr
             .map(|addr| align_up(addr, PAGE_SIZE))
             .unwrap_or_else(|| self.next_free_mmap_addr(len));
 
-        self.add_region(MemoryRegion::new(addr, len, vec![0; len as usize]))?;
+        if replace {
+            self.unmap_overlaps(addr, len)?;
+        }
+
+        self.add_region(MemoryRegion::new_with_flags(
+            addr,
+            len,
+            vec![0; len as usize],
+            flags,
+        ))?;
+
+        if requested_addr.is_none() {
+            self.next_mmap_addr = align_up(addr + len, PAGE_SIZE);
+        }
+
+        Ok(addr)
+    }
+
+    pub fn mmap_bytes(
+        &mut self,
+        requested_addr: Option<u64>,
+        len: u64,
+        mut data: Vec<u8>,
+        flags: u64,
+        replace: bool,
+    ) -> Result<u64, MemoryError> {
+        let len = align_up(len, PAGE_SIZE);
+        data.resize(len as usize, 0);
+        let addr = requested_addr
+            .map(|addr| align_up(addr, PAGE_SIZE))
+            .unwrap_or_else(|| self.next_free_mmap_addr(len));
+
+        if replace {
+            self.unmap_overlaps(addr, len)?;
+        }
+
+        self.add_region(MemoryRegion::new_with_flags(addr, len, data, flags))?;
 
         if requested_addr.is_none() {
             self.next_mmap_addr = align_up(addr + len, PAGE_SIZE);
@@ -214,6 +335,7 @@ impl Ram {
 
         let changes_code = biggest_reg.is_execute();
         biggest_reg.extend(offset);
+        self.invalidate_fast_cache();
         if changes_code {
             self.bump_code_version();
         }
@@ -241,7 +363,7 @@ impl Ram {
         }
 
         self.regions.remove(index);
-        self.cached_region_index = None;
+        self.invalidate_fast_cache();
         self.recompute_lowest_unalloced_addr();
         if changes_code {
             self.bump_code_version();
@@ -270,7 +392,6 @@ impl Ram {
         let changes_code = self.regions[index].is_execute();
         if addr == region_start && end == region_end {
             self.regions.remove(index);
-            self.cached_region_index = None;
         } else if addr == region_start {
             let remove_len = (end - region_start) as usize;
             let region = &mut self.regions[index];
@@ -296,9 +417,9 @@ impl Ram {
                 index + 1,
                 MemoryRegion::new_with_flags(end, region_end - end, right_data, flags),
             );
-            self.cached_region_index = None;
         }
 
+        self.invalidate_fast_cache();
         self.recompute_lowest_unalloced_addr();
         if changes_code {
             self.bump_code_version();
@@ -332,6 +453,27 @@ impl Ram {
                 return candidate;
             }
         }
+    }
+
+    fn unmap_overlaps(&mut self, addr: u64, len: u64) -> Result<(), MemoryError> {
+        let end = addr
+            .checked_add(len)
+            .ok_or(MemoryError::InvalidAddress(addr))?;
+        let overlaps = self
+            .regions
+            .iter()
+            .filter_map(|region| {
+                let overlap_start = addr.max(region.start);
+                let overlap_end = end.min(region.end());
+                (overlap_start < overlap_end).then_some((overlap_start, overlap_end))
+            })
+            .collect::<Vec<_>>();
+
+        for (overlap_start, overlap_end) in overlaps {
+            self.munmap(overlap_start, overlap_end - overlap_start)?;
+        }
+
+        Ok(())
     }
 
     fn recompute_lowest_unalloced_addr(&mut self) {
@@ -408,14 +550,95 @@ impl Ram {
             }
         }
 
+        for index in self.cached_region_indices.into_iter().flatten() {
+            if Some(index) == self.cached_region_index {
+                continue;
+            }
+            if let Some(region) = self.regions.get(index) {
+                if address >= region.start && end <= region.end() {
+                    self.remember_region_index(index);
+                    return Some(index);
+                }
+            }
+        }
+
         let index = self.find_region_index(address)?;
         let region = &self.regions[index];
         if end <= region.end() {
-            self.cached_region_index = Some(index);
+            self.remember_region_index(index);
             Some(index)
         } else {
             None
         }
+    }
+
+    fn fast_cached_read_ptr_range(&self, address: u64, len: usize) -> Option<*const u8> {
+        let end = address.checked_add(len as u64)?;
+        for cache in &self.jit_fast_caches {
+            if cache.read_ptr.is_null() {
+                continue;
+            }
+            if address >= cache.start && end <= cache.end {
+                let offset = (address - cache.start) as usize;
+                return Some(cache.read_ptr.wrapping_add(offset));
+            }
+        }
+        None
+    }
+
+    fn fast_cached_write_ptr_range(&self, address: u64, len: usize) -> Option<*mut u8> {
+        let end = address.checked_add(len as u64)?;
+        for cache in &self.jit_fast_caches {
+            if cache.write_ptr.is_null() {
+                continue;
+            }
+            if address >= cache.start && end <= cache.end {
+                let offset = (address - cache.start) as usize;
+                return Some(cache.write_ptr.wrapping_add(offset));
+            }
+        }
+        None
+    }
+
+    fn invalidate_fast_cache(&mut self) {
+        self.cached_region_index = None;
+        self.cached_region_indices = [None; JIT_FAST_CACHE_ENTRIES];
+        self.jit_fast_caches = [JitFastMemoryCache::default(); JIT_FAST_CACHE_ENTRIES];
+    }
+
+    fn remember_region_index(&mut self, index: usize) {
+        self.cached_region_index = Some(index);
+
+        let existing_position = self
+            .cached_region_indices
+            .iter()
+            .position(|cached| *cached == Some(index))
+            .unwrap_or(JIT_FAST_CACHE_ENTRIES - 1);
+        for slot in (1..=existing_position).rev() {
+            self.cached_region_indices[slot] = self.cached_region_indices[slot - 1];
+        }
+        self.cached_region_indices[0] = Some(index);
+        self.rebuild_jit_fast_caches();
+    }
+
+    fn rebuild_jit_fast_caches(&mut self) {
+        let indices = self.cached_region_indices;
+        let mut caches = [JitFastMemoryCache::default(); JIT_FAST_CACHE_ENTRIES];
+        for (slot, index) in indices.into_iter().flatten().enumerate() {
+            if let Some(region) = self.regions.get_mut(index) {
+                caches[slot] = JitFastMemoryCache {
+                    start: region.start,
+                    end: region.end(),
+                    read_ptr: region.data.as_ptr(),
+                    write_ptr: if region.is_execute() {
+                        std::ptr::null_mut()
+                    } else {
+                        region.data.as_mut_ptr()
+                    },
+                };
+            }
+        }
+        self.jit_fast_caches = caches;
     }
 
     pub fn read_byte(&self, address: u64) -> Result<u8, MemoryError> {
@@ -486,6 +709,46 @@ impl Ram {
         self.read_nbytes(address, len)
     }
 
+    pub fn read_u8_cached(&mut self, address: u64) -> Result<u8, MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, 1) {
+            let region = &self.regions[index];
+            let offset = (address - region.start) as usize;
+            return Ok(region.data[offset]);
+        }
+
+        self.read_byte(address)
+    }
+
+    pub fn read_u16_cached(&mut self, address: u64) -> Result<u16, MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, 2) {
+            let region = &self.regions[index];
+            let offset = (address - region.start) as usize;
+            return Ok(read_le_nbytes(&region.data, offset, 2) as u16);
+        }
+
+        self.read_nbytes(address, 2).map(|value| value as u16)
+    }
+
+    pub fn read_u32_cached(&mut self, address: u64) -> Result<u32, MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, 4) {
+            let region = &self.regions[index];
+            let offset = (address - region.start) as usize;
+            return Ok(read_le_nbytes(&region.data, offset, 4) as u32);
+        }
+
+        self.read_word(address)
+    }
+
+    pub fn read_u64_cached(&mut self, address: u64) -> Result<u64, MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, 8) {
+            let region = &self.regions[index];
+            let offset = (address - region.start) as usize;
+            return Ok(read_le_nbytes(&region.data, offset, 8));
+        }
+
+        self.read_nbytes(address, 8)
+    }
+
     pub fn write_nbytes(&mut self, address: u64, value: u64, len: u64) -> Result<(), MemoryError> {
         if len <= 8 {
             if let Some(region) = self.find_region_range_mut(address, len as usize) {
@@ -531,12 +794,68 @@ impl Ram {
         self.write_nbytes(address, value, len)
     }
 
+    pub fn write_u8_cached(&mut self, address: u64, value: u8) -> Result<(), MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, 1) {
+            let changes_code = {
+                let region = &mut self.regions[index];
+                let offset = (address - region.start) as usize;
+                let changes_code = region.is_execute();
+                region.data[offset] = value;
+                changes_code
+            };
+            if changes_code {
+                self.bump_code_version();
+            }
+            return Ok(());
+        }
+
+        self.write_byte(address, value)
+    }
+
+    pub fn write_u16_cached(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
+        self.write_cached_scalar(address, u64::from(value), 2)
+    }
+
+    pub fn write_u32_cached(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
+        self.write_cached_scalar(address, u64::from(value), 4)
+    }
+
+    pub fn write_u64_cached(&mut self, address: u64, value: u64) -> Result<(), MemoryError> {
+        self.write_cached_scalar(address, value, 8)
+    }
+
+    fn write_cached_scalar(
+        &mut self,
+        address: u64,
+        value: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        if let Some(index) = self.cached_region_index_for_range(address, len) {
+            let changes_code = {
+                let region = &mut self.regions[index];
+                let offset = (address - region.start) as usize;
+                let changes_code = region.is_execute();
+                write_le_nbytes(&mut region.data, offset, value, len);
+                changes_code
+            };
+            if changes_code {
+                self.bump_code_version();
+            }
+            return Ok(());
+        }
+
+        self.write_nbytes(address, value, len as u64)
+    }
+
     pub(crate) fn direct_write_ptr_range(
         &mut self,
         address: u64,
         len: u64,
     ) -> Result<*mut u8, MemoryError> {
         let len = usize::try_from(len).map_err(|_| MemoryError::InvalidAddress(address))?;
+        if let Some(ptr) = self.fast_cached_write_ptr_range(address, len) {
+            return Ok(ptr);
+        }
         if let Some(index) = self.cached_region_index_for_range(address, len) {
             let changes_code = {
                 let region = &self.regions[index];
@@ -566,16 +885,20 @@ impl Ram {
     }
 
     pub(crate) fn direct_read_ptr_range(
-        &self,
+        &mut self,
         address: u64,
         len: u64,
     ) -> Result<*const u8, MemoryError> {
         let len = usize::try_from(len).map_err(|_| MemoryError::InvalidAddress(address))?;
-        let region = self
-            .find_region_range(address, len)
-            .ok_or(MemoryError::InvalidAddress(address))?;
-        let offset = (address - region.start) as usize;
-        Ok(region.data.as_ptr().wrapping_add(offset))
+        if let Some(ptr) = self.fast_cached_read_ptr_range(address, len) {
+            return Ok(ptr);
+        }
+        if let Some(index) = self.cached_region_index_for_range(address, len) {
+            let region = &self.regions[index];
+            let offset = (address - region.start) as usize;
+            return Ok(region.data.as_ptr().wrapping_add(offset));
+        }
+        Err(MemoryError::InvalidAddress(address))
     }
 
     pub(crate) fn read_slice_range(&self, address: u64, len: u64) -> Result<&[u8], MemoryError> {
@@ -698,7 +1021,7 @@ impl Display for Ram {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryRegion {
     start: u64,
     size: u64,
@@ -840,5 +1163,24 @@ mod tests {
 
         ram.write_byte(0x1000, 1).unwrap();
         assert_eq!(ram.code_version(), loaded_version + 1);
+    }
+
+    #[test]
+    fn direct_pointer_ranges_reuse_jit_fast_cache() {
+        let mut ram = Ram::new();
+        ram.add_region(MemoryRegion::new(0x1000, 32, vec![0; 32]))
+            .unwrap();
+
+        let read_ptr = ram.direct_read_ptr_range(0x1004, 8).unwrap();
+        let cache = ram.jit_fast_caches[0];
+        assert_eq!(read_ptr, unsafe { cache.read_ptr.add(4) });
+
+        let write_ptr = ram.direct_write_ptr_range(0x1008, 8).unwrap();
+        assert_eq!(write_ptr, unsafe { cache.write_ptr.add(8) });
+        unsafe {
+            write_ptr.write(0xab);
+        }
+
+        assert_eq!(ram.read_byte(0x1008).unwrap(), 0xab);
     }
 }

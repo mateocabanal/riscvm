@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub(crate) const DEFAULT_HOT_THRESHOLD: u64 = 1;
+pub(crate) const DEFAULT_HOT_THRESHOLD: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JitTier {

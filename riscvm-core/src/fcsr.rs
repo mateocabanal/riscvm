@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct FCSR {
     pub frm: RoundingMode,
     fflags: u8,

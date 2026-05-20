@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::time::{Duration, Instant};
 
+use crate::debug;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionEngine {
     Interpreter,
@@ -32,6 +34,7 @@ pub struct TraceOptions {
     pub profile: bool,
     pub top_limit: usize,
     pub trace_limit: Option<u64>,
+    pub profile_interval: Option<u64>,
 }
 
 impl Default for TraceOptions {
@@ -41,6 +44,7 @@ impl Default for TraceOptions {
             profile: false,
             top_limit: 20,
             trace_limit: None,
+            profile_interval: None,
         }
     }
 }
@@ -100,6 +104,7 @@ pub struct ExecutionTracer {
     jit_background_queue_full: u64,
     trace_events_emitted: u64,
     trace_limit_reported: bool,
+    next_profile_report_at: Option<u64>,
     instructions: HashMap<u64, InstructionProfile>,
     blocks: HashMap<u64, BlockProfile>,
     syscalls: HashMap<u64, u64>,
@@ -127,6 +132,7 @@ impl ExecutionTracer {
             jit_background_queue_full: 0,
             trace_events_emitted: 0,
             trace_limit_reported: false,
+            next_profile_report_at: options.profile_interval,
             instructions: HashMap::new(),
             blocks: HashMap::new(),
             syscalls: HashMap::new(),
@@ -135,6 +141,85 @@ impl ExecutionTracer {
 
     pub fn options(&self) -> TraceOptions {
         self.options
+    }
+
+    pub fn merge_child(&mut self, child: &ExecutionTracer) {
+        if self.engine.is_none() {
+            self.engine = child.engine;
+        }
+        self.elapsed += child.elapsed();
+        self.instruction_count = self
+            .instruction_count
+            .saturating_add(child.instruction_count);
+        self.interpreter_steps = self
+            .interpreter_steps
+            .saturating_add(child.interpreter_steps);
+        self.jit_block_entries = self
+            .jit_block_entries
+            .saturating_add(child.jit_block_entries);
+        self.jit_compiles = self.jit_compiles.saturating_add(child.jit_compiles);
+        self.jit_cache_hits = self.jit_cache_hits.saturating_add(child.jit_cache_hits);
+        self.jit_cache_misses = self.jit_cache_misses.saturating_add(child.jit_cache_misses);
+        self.jit_code_bytes = self.jit_code_bytes.saturating_add(child.jit_code_bytes);
+        self.jit_compile_time += child.jit_compile_time;
+        self.jit_execute_time += child.jit_execute_time;
+        self.jit_background_queued = self
+            .jit_background_queued
+            .saturating_add(child.jit_background_queued);
+        self.jit_background_adopted = self
+            .jit_background_adopted
+            .saturating_add(child.jit_background_adopted);
+        self.jit_background_discarded = self
+            .jit_background_discarded
+            .saturating_add(child.jit_background_discarded);
+        self.jit_background_queue_full = self
+            .jit_background_queue_full
+            .saturating_add(child.jit_background_queue_full);
+
+        for (pc, instruction) in &child.instructions {
+            self.record_instruction(
+                *pc,
+                instruction.opcode,
+                &instruction.text,
+                instruction.count,
+            );
+        }
+
+        for (pc, child_block) in &child.blocks {
+            let block = self.blocks.entry(*pc).or_insert_with(|| BlockProfile {
+                pc: *pc,
+                count: 0,
+                instruction_repetitions: 0,
+                instruction_traces: Vec::new(),
+                instructions: child_block.instructions,
+                code_bytes: child_block.code_bytes,
+                compile_count: 0,
+                compile_time: Duration::ZERO,
+                execute_time: Duration::ZERO,
+            });
+            block.count = block.count.saturating_add(child_block.count);
+            block.instruction_repetitions = block
+                .instruction_repetitions
+                .saturating_add(child_block.instruction_repetitions);
+            block.instructions = child_block.instructions;
+            block.code_bytes = child_block.code_bytes;
+            block.compile_count = block
+                .compile_count
+                .saturating_add(child_block.compile_count);
+            block.compile_time += child_block.compile_time;
+            block.execute_time += child_block.execute_time;
+            if block.instruction_traces.is_empty() {
+                block
+                    .instruction_traces
+                    .extend_from_slice(&child_block.instruction_traces);
+            }
+        }
+
+        for (syscall_id, count) in &child.syscalls {
+            let syscall = self.syscalls.entry(*syscall_id).or_insert(0);
+            *syscall = syscall.saturating_add(*count);
+        }
+        self.maybe_emit_periodic_profile();
     }
 
     pub fn start(&mut self, engine: ExecutionEngine) {
@@ -177,6 +262,7 @@ impl ExecutionTracer {
         } else {
             self.record_instruction_lazy(pc, opcode, 1, text);
         }
+        self.maybe_emit_periodic_profile();
     }
 
     pub fn record_jit_cache_hit(&mut self) {
@@ -279,6 +365,33 @@ impl ExecutionTracer {
             "[trace:jit] block pc=0x{pc:016x} instructions={executed_instructions} code_bytes={code_bytes} next_pc=0x{next_pc:016x} elapsed={}",
             format_duration(duration)
         ));
+        self.maybe_emit_periodic_profile();
+    }
+
+    fn maybe_emit_periodic_profile(&mut self) {
+        let Some(mut next_report_at) = self.next_profile_report_at else {
+            return;
+        };
+        if self.instruction_count < next_report_at {
+            return;
+        }
+
+        debug::write(format_args!("{}", self.report()));
+        let Some(interval) = self
+            .options
+            .profile_interval
+            .filter(|interval| *interval > 0)
+        else {
+            self.next_profile_report_at = None;
+            return;
+        };
+        while self.instruction_count >= next_report_at {
+            next_report_at = next_report_at.saturating_add(interval);
+            if next_report_at == u64::MAX {
+                break;
+            }
+        }
+        self.next_profile_report_at = Some(next_report_at);
     }
 
     pub fn record_syscall(&mut self, syscall_id: u64) {
@@ -379,9 +492,47 @@ impl ExecutionTracer {
                     format_duration(block.execute_time)
                 );
             }
+
+            let mut slow_blocks: Vec<_> = self
+                .blocks
+                .values()
+                .filter(|block| !block.execute_time.is_zero())
+                .collect();
+            slow_blocks.sort_by(|lhs, rhs| {
+                rhs.execute_time
+                    .cmp(&lhs.execute_time)
+                    .then(lhs.pc.cmp(&rhs.pc))
+            });
+            if !slow_blocks.is_empty() {
+                let _ = writeln!(report, "[profile] slow jit blocks:");
+                for block in slow_blocks.into_iter().take(self.options.top_limit) {
+                    let _ = writeln!(
+                        report,
+                        "[profile]   pc=0x{:016x} execute_time={} count={} instructions={} code_bytes={} compiles={}",
+                        block.pc,
+                        format_duration(block.execute_time),
+                        block.count,
+                        block.instructions,
+                        block.code_bytes,
+                        block.compile_count
+                    );
+                }
+            }
         }
 
         report
+    }
+
+    pub fn hot_jit_blocks(&self, limit: usize) -> Vec<(u64, u64)> {
+        let mut blocks: Vec<_> = self
+            .blocks
+            .values()
+            .filter(|block| block.count > 0)
+            .map(|block| (block.pc, block.count))
+            .collect();
+        blocks.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then(lhs.0.cmp(&rhs.0)));
+        blocks.truncate(limit);
+        blocks
     }
 
     fn elapsed(&self) -> Duration {
@@ -453,14 +604,16 @@ impl ExecutionTracer {
         if let Some(limit) = self.options.trace_limit {
             if self.trace_events_emitted >= limit {
                 if !self.trace_limit_reported {
-                    eprintln!("[trace] trace limit reached after {limit} events");
+                    debug::line(format_args!(
+                        "[trace] trace limit reached after {limit} events"
+                    ));
                     self.trace_limit_reported = true;
                 }
                 return;
             }
         }
 
-        eprintln!("{args}");
+        debug::line(args);
         self.trace_events_emitted = self.trace_events_emitted.saturating_add(1);
     }
 }
